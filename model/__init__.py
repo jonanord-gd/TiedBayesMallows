@@ -1,0 +1,48 @@
+# Package initializer for the model subpackage.
+# Re-export key classes and functions for convenience.
+
+from .TiedMallowsModel import (
+    MixtureRankingModel,
+    ClusterParams,
+    MixtureState,
+    MCMCSamples,
+    SamplerConfig,
+    estimate_z_from_frequency,
+    summarize_theta,
+    init_blocks_borda_threshold,
+    gibbs_reassign_one_item,
+    mh_py_prior_reassign_one_item,
+    mh_adjacent_split_merge,
+    mh_adjacent_item_transfer,
+    mh_ordering_swap_or_shift,
+    logsumexp,
+    sample_categorical_from_logweights,
+    dirichlet_sample,
+    enable_profiling,
+    disable_profiling,
+    get_profiler,
+    reset_profiling,
+)
+
+__all__ = [
+    "MixtureRankingModel",
+    "ClusterParams",
+    "MixtureState",
+    "MCMCSamples",
+    "SamplerConfig",
+    "estimate_z_from_frequency",
+    "summarize_theta",
+    "init_blocks_borda_threshold",
+    "gibbs_reassign_one_item",
+    "mh_py_prior_reassign_one_item",
+    "mh_adjacent_split_merge",
+    "mh_adjacent_item_transfer",
+    "mh_ordering_swap_or_shift",
+    "logsumexp",
+    "sample_categorical_from_logweights",
+    "dirichlet_sample",
+    "enable_profiling",
+    "disable_profiling",
+    "get_profiler",
+    "reset_profiling",
+]
