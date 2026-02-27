@@ -295,10 +295,10 @@ class MixtureRankingModel:
         *,
         n_item_moves: int = 2,
         p_gibbs_reassign: float = 0.0,
-        p_transfer: float = 0.4,
-        p_swapshift: float = 0.4,
-        p_splitmerge: float = 0.2,
-        p_reassign: float = 0.0,
+        p_transfer: float = 0.25,
+        p_swapshift: float = 0.25,
+        p_splitmerge: float = 0.25,
+        p_reassign: float = 0.25,
         gamma: Optional[float] = None,
         delta: Optional[float] = None,
         profiler=None,  # OPTIMIZATION: Accept profiler instead of calling get_profiler() in loop
@@ -328,8 +328,13 @@ class MixtureRankingModel:
         cfg_ordering_max_long_step = cfg.ordering_max_long_step
         cfg_splitmerge_p_merge = cfg.splitmerge_p_merge
 
+# Normalize ALL move probabilities (including p_reassign for the else clause)
+        # The 4 block moves + 1 reassign move form a complete set of options
         s = p_gibbs_reassign + p_transfer + p_swapshift + p_splitmerge + p_reassign
-        p_gibbs_reassign, p_transfer, p_swapshift, p_splitmerge, p_reassign = (
+        if s <= 0:
+            # Fallback if all probabilities are 0
+            s = 1.0
+        p_gibbs_reassign, p_transfer, p_swapshift, p_splitmerge, p_reassign= (
             p_gibbs_reassign / s,
             p_transfer / s,
             p_swapshift / s,

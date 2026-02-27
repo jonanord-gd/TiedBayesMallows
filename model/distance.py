@@ -47,14 +47,14 @@ if _USE_NUMBA:
         for idx in range(len(strict_r)):
             item = strict_r[idx]
             b = block_idx[item]
-            # prefix sum
+            # prefix sum - query 0 to b (inclusive)
             s = 0
             i = b + 1
-            while i <= K:
+            while i > 0:  # FIX: Descend Fenwick tree by subtracting i & -i
                 s += fw[i]
-                i += i & -i
+                i -= i & -i
             inv += seen - s
-            # add
+            # add b to Fenwick tree
             i = b + 1
             while i <= K:
                 fw[i] += 1
