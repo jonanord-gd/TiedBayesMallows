@@ -25,7 +25,7 @@ from .moves import (
     mh_ordering_swap_or_shift,
 )
 from .utils import logsumexp, sample_categorical_from_logweights, dirichlet_sample
-from .profiling import enable_profiling, disable_profiling, get_profiler, reset_profiling
+from .profiling import enable_profiling, disable_profiling, get_profiler, reset_profiling, MCMCProfiler
 
 __all__ = [
     "MixtureRankingModel",
@@ -48,5 +48,6 @@ __all__ = [
     "disable_profiling",
     "get_profiler",
     "reset_profiling",
+    "MCMCProfiler",
 ]
 

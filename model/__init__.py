@@ -22,6 +22,7 @@ from .TiedMallowsModel import (
     disable_profiling,
     get_profiler,
     reset_profiling,
+    MCMCProfiler,
 )
 
 __all__ = [
@@ -45,4 +46,5 @@ __all__ = [
     "disable_profiling",
     "get_profiler",
     "reset_profiling",
+    "MCMCProfiler",
 ]

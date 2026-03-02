@@ -104,7 +104,32 @@ def log_blocks_posterior(
     theta: float,
     gamma: float,
     delta: float,
+    blocks_old: Optional[List[List[int]]] = None,
+    distance_calculator=None,
+    parallel: bool = False,
 ) -> float:
+    """
+    Compute log posterior of blocks given cluster rankings.
+    
+    Parameters
+    ----------
+    rankings_c : list of lists
+        Cluster-specific rankings
+    blocks : list of lists
+        Block structure
+    theta, gamma, delta : float
+        Model parameters
+    blocks_old : list of lists, optional
+        Previous blocks (enables incremental distance calculation)
+    distance_calculator : object, optional
+        IncrementalDistanceCalculator for fast incremental updates
+    parallel : bool
+        Use parallel computation for distance calculation
+    
+    Returns
+    -------
+    log_posterior : float
+    """
     if not rankings_c:
         return float("-inf")
     sizes = [len(b) for b in blocks]
@@ -114,12 +139,20 @@ def log_blocks_posterior(
     
     profiler = get_profiler()
 
-    # Distance calculation
+    # Distance calculation - use incremental if available
     if profiler:
         t_start = time.time()
-    S = total_distance_fast(rankings_c, blocks)
-    if profiler:
-        profiler.record_operation("distance_calculation", time.time() - t_start)
+    
+    if distance_calculator is not None and blocks_old is not None:
+        # Use incremental calculation with smart heuristic
+        S = distance_calculator.compute_distance_with_heuristic(blocks_old, blocks, parallel=parallel)
+        if profiler:
+            profiler.record_operation("distance_calculation_incremental", time.time() - t_start)
+    else:
+        # Standard full calculation
+        S = total_distance_fast(rankings_c, blocks)
+        if profiler:
+            profiler.record_operation("distance_calculation", time.time() - t_start)
     
     # Z* calculation
     if profiler:

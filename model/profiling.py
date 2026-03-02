@@ -349,6 +349,160 @@ class MCMCProfiler:
         """Print the full profiling summary."""
         print(self.get_full_summary())
     
+    def detect_bottlenecks(self, threshold_pct: float = 10.0) -> Dict[str, any]:
+        """
+        Detect bottlenecks in MCMC execution.
+        
+        Identifies operations, moves, and stages that consume more than
+        threshold_pct of total time and may be targets for optimization.
+        
+        Parameters
+        ----------
+        threshold_pct : float
+            Percentage threshold (0-100) for flagging as bottleneck
+        
+        Returns
+        -------
+        bottlenecks : dict with keys:
+            - 'operations': List of slow operations  
+            - 'moves': List of slow moves
+            - 'stages': List of slow stages
+            - 'recommendations': Suggested optimizations
+        """
+        bottlenecks = {
+            'operations': [],
+            'moves': [],
+            'stages': [],
+            'recommendations': [],
+            'summary': {}
+        }
+        
+        # Find slow operations
+        if self.global_operations:
+            total_op_time = sum(o.total_time for o in self.global_operations.values())
+            for op in sorted(self.global_operations.values(), key=lambda x: x.total_time, reverse=True):
+                pct = (op.total_time / total_op_time * 100) if total_op_time > 0 else 0
+                if pct >= threshold_pct:
+                    bottlenecks['operations'].append({
+                        'name': op.op_name,
+                        'time': op.total_time,
+                        'calls': op.call_count,
+                        'pct': pct,
+                        'per_call_ms': op.avg_time
+                    })
+        
+        # Find slow moves
+        if self.move_times:
+            total_move_time = sum(m.total_time for m in self.move_times.values())
+            for move in sorted(self.move_times.values(), key=lambda x: x.total_time, reverse=True):
+                pct = (move.total_time / total_move_time * 100) if total_move_time > 0 else 0
+                if pct >= threshold_pct:
+                    bottlenecks['moves'].append({
+                        'name': move.move_name,
+                        'time': move.total_time,
+                        'calls': move.call_count,
+                        'pct': pct,
+                        'acceptance': move.acceptance_rate,
+                        'per_call_ms': move.avg_time
+                    })
+        
+        # Find slow stages
+        if self.stage_times:
+            total_stage_time = sum(self.stage_times.values())
+            for stage in sorted(self.stage_times.keys(), key=lambda x: self.stage_times[x], reverse=True):
+                pct = (self.stage_times[stage] / total_stage_time * 100) if total_stage_time > 0 else 0
+                if pct >= threshold_pct:
+                    bottlenecks['stages'].append({
+                        'name': stage,
+                        'time': self.stage_times[stage],
+                        'calls': self.stage_calls[stage],
+                        'pct': pct,
+                        'per_call_ms': (self.stage_times[stage] / self.stage_calls[stage] * 1000)
+                    })
+        
+        # Generate recommendations
+        if bottlenecks['operations']:
+            slow_ops = [b['name'] for b in bottlenecks['operations']]
+            if 'distance_calculation' in slow_ops:
+                bottlenecks['recommendations'].append(
+                    "💡 DISTANCE CALCULATION dominates. Consider:\n"
+                    "   - Using incremental distance updates for mh_reassign/swapshift\n"
+                    "   - Reducing number of assessors or items per ranking\n"
+                    "   - Enabling incremental_distance_delta_calc if available"
+                )
+            if 'inversion_counting_all_rankings' in slow_ops:
+                bottlenecks['recommendations'].append(
+                    "💡 INVERSION COUNTING is expensive. Ensure:\n"
+                    "   - Numba JIT compilation is enabled (check _USE_NUMBA flag)\n"
+                    "   - Consider caching inversion counts between proposals"
+                )
+            if 'z_star_calculation' in slow_ops:
+                bottlenecks['recommendations'].append(
+                    "💡 Z* calculation is slow. Try:\n"
+                    "   - Caching Z* values for stable theta values\n"
+                    "   - Reducing dimensionality of the problem"
+                )
+        
+        if bottlenecks['moves']:
+            slow_moves = [b['name'] for b in bottlenecks['moves']]
+            low_accept = [m for m in bottlenecks['moves'] if m['acceptance'] < 0.3]
+            if low_accept:
+                bottlenecks['recommendations'].append(
+                    f"⚠️  LOW ACCEPTANCE RATE on {[m['name'] for m in low_accept]}. Actions:\n"
+                    "   - Adjust proposal distributions to increase acceptance\n"
+                    "   - Consider tuning move proposal parameters\n"
+                    "   - Reduce move probability for low-acceptance moves"
+                )
+        
+        # Store summary stats
+        bottlenecks['summary'] = {
+            'total_move_time': sum(m.total_time for m in self.move_times.values()),
+            'total_operation_time': sum(o.total_time for o in self.global_operations.values()),
+            'total_stage_time': sum(self.stage_times.values()),
+            'num_moves': len(self.move_times),
+            'num_operations': len(self.global_operations),
+            'num_stages': len(self.stage_times),
+        }
+        
+        return bottlenecks
+    
+    def print_bottlenecks(self, threshold_pct: float = 10.0) -> None:
+        """Print detected bottlenecks with recommendations."""
+        bottlenecks = self.detect_bottlenecks(threshold_pct)
+        
+        print("\n" + "="*120)
+        print("BOTTLENECK DETECTION REPORT")
+        print("="*120)
+        
+        print(f"\nThreshold: > {threshold_pct}% of total time\n")
+        
+        if bottlenecks['operations']:
+            print("🔍 SLOW OPERATIONS:")
+            for op in bottlenecks['operations']:
+                print(f"  • {op['name']:40s} : {op['pct']:6.1f}% ({op['time']:.3f}s, {op['per_call_ms']:.3f}ms/call)")
+        
+        if bottlenecks['moves']:
+            print("\n🔍 SLOW MOVES:")
+            for move in bottlenecks['moves']:
+                accept_str = f"[{move['acceptance']:.1%} accept]" if move['acceptance'] >= 0 else "[?]"
+                print(f"  • {move['name']:40s} : {move['pct']:6.1f}% ({move['time']:.3f}s, {move['per_call_ms']:.2f}ms/call) {accept_str}")
+        
+        if bottlenecks['stages']:
+            print("\n🔍 SLOW STAGES:")
+            for stage in bottlenecks['stages']:
+                print(f"  • {stage['name']:40s} : {stage['pct']:6.1f}% ({stage['time']:.3f}s, {stage['per_call_ms']:.2f}ms/call)")
+        
+        if bottlenecks['recommendations']:
+            print("\n💡 RECOMMENDATIONS:")
+            for i, rec in enumerate(bottlenecks['recommendations'], 1):
+                print(f"\n{i}. {rec}")
+        
+        if not (bottlenecks['operations'] or bottlenecks['moves'] or bottlenecks['stages']):
+            print("✅ No major bottlenecks detected (all operations < threshold).")
+        
+        print("\n" + "="*120)
+
+    
     def get_slowest_moves(self, top_n: int = 5) -> List[tuple]:
         """Return the top N slowest moves (move_name, total_time)."""
         if not self.move_times:

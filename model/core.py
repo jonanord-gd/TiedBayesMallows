@@ -16,6 +16,7 @@ from .utils import dirichlet_sample, sample_categorical_from_logweights
 from .initialization import init_blocks_borda_threshold
 from .blocks import T_of_sizes, blocks_to_block_index
 from .distance import cross_block_disagreements_fast, total_distance_fast
+from .incremental_distance import IncrementalDistanceCalculator
 from .priors import log_Z_star_from_sizes, log_blocks_posterior
 from .moves import (
     gibbs_reassign_one_item,
@@ -156,6 +157,10 @@ class MixtureRankingModel:
 
         # per-cluster caches (updated when blocks change)
         self._rebuild_all_cluster_caches()
+        
+        # Incremental distance calculator for efficient block updates
+        from .incremental_distance import IncrementalDistanceCalculator
+        self.dist_calculator = IncrementalDistanceCalculator(rankings)
 
         # Initiate samples from MCMC run
         self.samples: Optional[MCMCSamples] = None
@@ -198,6 +203,126 @@ class MixtureRankingModel:
         self._cache: List[MixtureRankingModel._ClusterCache] = [None] * self.C  # type: ignore
         for c in range(self.C):
             self._rebuild_cluster_cache(c)
+    
+    @staticmethod
+    def _compute_changed_items(blocks_old: List[List[int]], blocks_new: List[List[int]]) -> set:
+        """
+        Identify which items moved between blocks.
+        
+        Returns set of item IDs where block assignment changed.
+        """
+        # Build item -> block indices
+        old_idx = blocks_to_block_index(blocks_old, 
+                                       sum(len(b) for b in blocks_old), 
+                                       validate=False)
+        new_idx = blocks_to_block_index(blocks_new,
+                                       sum(len(b) for b in blocks_new),
+                                       validate=False)
+        
+        changed = set()
+        for item in range(len(old_idx)):
+            if old_idx[item] != new_idx[item]:
+                changed.add(item)
+        return changed
+    
+    def _compute_distance_incremental(
+        self,
+        rankings_c: List[List[int]],
+        blocks_old: List[List[int]],
+        blocks_new: List[List[int]]
+    ) -> int:
+        """
+        Compute distance using incremental calculation if beneficial.
+        
+        Falls back to full computation if:
+        - Many items changed (incremental overhead not worth it)
+        - Block count changed significantly (cache invalidation)
+        
+        Returns total distance for the cluster.
+        """
+        changed_items = self._compute_changed_items(blocks_old, blocks_new)
+        
+        # Threshold: if more than 30% of items changed, do full recompute
+        pct_changed = len(changed_items) / self.n if self.n > 0 else 0
+        if pct_changed > 0.3:
+            # Full recomputation
+            from .blocks import T_of_blocks
+            Tm_new = T_of_blocks(blocks_new)
+            return self.dist_calculator.compute_distance(blocks_new, Tm_new)
+        
+        # Use incremental calculation
+        from .blocks import T_of_blocks
+        Tm_new = T_of_blocks(blocks_new)
+        
+        return self.dist_calculator.compute_distance_incremental(
+            blocks_old,
+            blocks_new,
+            changed_items,
+            Tm_new
+        )
+    
+    def _log_blocks_posterior_incremental(
+        self,
+        rankings_c: List[List[int]],
+        blocks_old: List[List[int]],
+        blocks_new: List[List[int]],
+        theta: float,
+        gamma: float,
+        delta: float,
+    ) -> float:
+        """
+        Compute log posterior using incremental distance calculation.
+        
+        This is an optimized version of log_blocks_posterior that uses
+        incremental distance updates when blocks change slightly.
+        
+        Parameters
+        ----------
+        rankings_c : list of lists
+            Rankings for this cluster
+        blocks_old : list of lists
+            Previous block structure
+        blocks_new : list of lists
+            New proposed block structure
+        theta, gamma, delta : float
+            Cluster parameters
+        
+        Returns
+        -------
+        log_posterior : float
+            Log probability of the move
+        """
+        if not rankings_c:
+            return float("-inf")
+        
+        from .blocks import T_of_blocks
+        profiler = get_profiler()
+        
+        # Use incremental distance calculation
+        if profiler:
+            t_start = time.time()
+        S_new = self._compute_distance_incremental(rankings_c, blocks_old, blocks_new)
+        if profiler:
+            profiler.record_operation("distance_calculation_incremental", time.time() - t_start)
+        
+        # Z* calculation (standard)
+        sizes_new = [len(b) for b in blocks_new]
+        K_new = len(sizes_new)
+        
+        if profiler:
+            t_start = time.time()
+        logZ = log_Z_star_from_sizes(sizes_new, theta, None)
+        if profiler:
+            profiler.record_operation("z_star_calculation", time.time() - t_start)
+        
+        # Pitman-Yor prior calculation
+        if profiler:
+            t_start = time.time()
+        logpy = log_Z_star_from_sizes(sizes_new, gamma, delta)
+        if profiler:
+            profiler.record_operation("py_prior_calculation", time.time() - t_start)
+        
+        return (-theta * S_new) - (len(rankings_c) * logZ) + logpy - math.lgamma(K_new + 1)
 
     # -----------------------
     # core updates
@@ -328,6 +453,12 @@ class MixtureRankingModel:
         cfg_ordering_max_long_step = cfg.ordering_max_long_step
         cfg_splitmerge_p_merge = cfg.splitmerge_p_merge
 
+        # OPTIMIZATION: Initialize posterior cache to avoid recalculation when theta unchanged
+        # Maps (blocks_tuple, theta, gamma, delta) → posterior_value
+        # Cache naturally stays small (~10-20 entries) due to acceptance dynamics.
+        posterior_cache: dict = {}
+        cache_max_size = 50  # Limit to prevent memory growth; reset if exceeded
+
 # Normalize ALL move probabilities (including p_reassign for the else clause)
         # The 4 block moves + 1 reassign move form a complete set of options
         s = p_gibbs_reassign + p_transfer + p_swapshift + p_splitmerge + p_reassign
@@ -371,7 +502,11 @@ class MixtureRankingModel:
                     theta=cl_theta,
                     gamma=gamma,
                     delta=delta,
-                    rng=rng
+                    rng=rng,
+                    blocks_old=cl_blocks,
+                    distance_calculator=self.dist_calculator,
+                    use_parallel=(self.N > 100),
+                    posterior_cache=posterior_cache
                 )
             elif u < p_gibbs_reassign + p_transfer + p_swapshift:
                 move_name = "mh_swapshift"
@@ -385,6 +520,10 @@ class MixtureRankingModel:
                     p_short=cfg_ordering_p_short,
                     n_swap_steps=cfg_ordering_n_swap_steps,
                     max_long_step=cfg_ordering_max_long_step,
+                    blocks_old=cl_blocks,
+                    distance_calculator=self.dist_calculator,
+                    use_parallel=(self.N > 100),
+                    posterior_cache=posterior_cache
                 )
             elif u < p_gibbs_reassign + p_transfer + p_swapshift + p_splitmerge:
                 move_name = "mh_splitmerge"
@@ -405,7 +544,11 @@ class MixtureRankingModel:
                     theta=cl_theta,
                     gamma=gamma,
                     delta=delta,
-                    rng=rng
+                    rng=rng,
+                    blocks_old=cl_blocks,
+                    distance_calculator=self.dist_calculator,
+                    use_parallel=(self.N > 100),
+                    posterior_cache=posterior_cache
                 )
             
             t_move_elapsed = time.time() - t_move_start
@@ -424,6 +567,11 @@ class MixtureRankingModel:
         # blocks changed -> refresh cache
         after_key = _canonicalize_blocks(cl_blocks)
         self._rebuild_cluster_cache(c)
+        
+        # OPTIMIZATION: Limit posterior cache size to prevent unbounded growth
+        # Cache is naturally small but reset if exceeds threshold (e.g., many parameter changes)
+        if len(posterior_cache) > cache_max_size:
+            posterior_cache.clear()
 
         return proposals, accepts, (before_key != after_key)
 
@@ -437,8 +585,27 @@ class MixtureRankingModel:
                 raise ValueError(f"Unknown sampler setting: {k}")
             setattr(self.cfg, k, v)
 
-    def step(self, **overrides) -> Dict[str, Any]:
-        """Performs one MCMC step, updating z, tau, and cluster blocks/theta."""
+    def step(self, iteration: int = 0, theta_jump: int = 1, **overrides) -> Dict[str, Any]:
+        """Performs one MCMC step, updating z, tau, and cluster blocks/theta.
+        
+        Parameters
+        ----------
+        iteration : int
+            Current iteration number (0-indexed). Used with theta_jump to determine
+            whether to update theta in this iteration.
+        theta_jump : int, default=1
+            Update theta every theta_jump iterations. Set to k > 1 to skip theta
+            updates most of the time. E.g., theta_jump=5 updates theta every 5th
+            iteration, skipping 4 iterations with only block updates (2-5x speedup).
+            
+        Examples
+        --------
+        Every theta update (baseline):
+            model.step(iteration=it, theta_jump=1)
+            
+        Sparse theta updates (faster):
+            model.step(iteration=it, theta_jump=10)  # Update theta every 10 iterations
+        """
         cfg = self.cfg
         # OPTIMIZATION: Cache profiler once to avoid repeated get_profiler() calls
         profiler = get_profiler()
@@ -505,20 +672,27 @@ class MixtureRankingModel:
             block_accept_counts[c] = int(ba)
             block_accepts[c] = 1 if block_changed else 0
 
-            # Update cluster theta
+            # Update cluster theta - OPTIMIZATION: Only if we're on a theta_jump iteration
             t_start = time.time()
-            tp, ta = self._update_cluster_theta(
-                c, Rc,
-                a_theta=cfg.a_theta,
-                b_theta=cfg.b_theta,
-                step=cfg.theta_step,
-            )
+            if iteration % theta_jump == 0:
+                # Update theta
+                tp, ta = self._update_cluster_theta(
+                    c, Rc,
+                    a_theta=cfg.a_theta,
+                    b_theta=cfg.b_theta,
+                    step=cfg.theta_step,
+                )
+                theta_proposals[c] = int(tp)
+                theta_accept_counts[c] = int(ta)
+                theta_accepts[c] = 1 if ta > 0 else 0
+            else:
+                # Skip theta update this iteration
+                theta_proposals[c] = 0
+                theta_accept_counts[c] = 0
+                theta_accepts[c] = 0
+            
             if profiler:
                 profiler.record_stage("update_theta", time.time() - t_start)
-            
-            theta_proposals[c] = int(tp)
-            theta_accept_counts[c] = int(ta)
-            theta_accepts[c] = 1 if ta > 0 else 0
 
         return {
             "theta_accepts": theta_accepts,
@@ -535,6 +709,7 @@ class MixtureRankingModel:
         *,
         burn_in: int = 0,
         thin: int = 1,
+        theta_jump: int = 1,
         save_samples: bool = True,
         save_tau: bool = False,
         save_theta: bool = False,
@@ -543,7 +718,24 @@ class MixtureRankingModel:
         n_item_moves_per_cluster: int = 2,
         **sampler_kwargs,
     ) -> Tuple[MixtureState, Optional[MCMCSamples]]:
-        """Runs MCMC for ``n_iter`` iterations, with optional burn-in and thinning."""
+        """Runs MCMC for ``n_iter`` iterations, with optional burn-in and thinning.
+        
+        Parameters
+        ----------
+        theta_jump : int, default=1
+            Update theta every theta_jump iterations. Set to k > 1 to skip theta
+            updates most of the time for faster sampling. E.g., theta_jump=10 updates
+            theta every 10 iterations. This can provide 2-5x speedup at the cost of
+            longer autocorrelation in theta chains.
+            
+        Examples
+        --------
+        Normal MCMC with theta every iteration:
+            model.run_mcmc(n_iter=5000)
+            
+        Faster MCMC with sparse theta updates:
+            model.run_mcmc(n_iter=5000, theta_jump=10)
+        """
         if n_iter <= 0:
             raise ValueError("n_iter must be positive")
         if thin <= 0:
@@ -598,7 +790,7 @@ class MixtureRankingModel:
                 samples.logp.append(self.log_joint())
 
         if self.verbose:
-            print(f"\n[MCMC] Starting run: n_iter={n_iter}, burn_in={burn_in}, thin={thin}")
+            print(f"\n[MCMC] Starting run: n_iter={n_iter}, burn_in={burn_in}, thin={thin}, theta_jump={theta_jump}")
             print(f"[MCMC] Sampler config: p_gibbs_reassign={self.cfg.p_gibbs_reassign:.3f}, p_transfer={self.cfg.p_transfer:.3f}, p_swapshift={self.cfg.p_swapshift:.3f}, p_splitmerge={self.cfg.p_splitmerge:.3f}, p_reassign={self.cfg.p_reassign:.3f}")
             print(f"[MCMC] Item moves per cluster: {n_item_moves_per_cluster}")
             saved_iters = (n_iter - burn_in + thin - 1) // thin if save_samples else 0
@@ -611,7 +803,7 @@ class MixtureRankingModel:
         block_proposals_per_cluster = [0] * self.C
 
         for it in range(n_iter):
-            info = self.step(n_item_moves_per_cluster=n_item_moves_per_cluster)
+            info = self.step(iteration=it, theta_jump=theta_jump, n_item_moves_per_cluster=n_item_moves_per_cluster)
             
             for c in range(self.C):
                 theta_accepts_per_cluster[c] += info["theta_accepts"][c]

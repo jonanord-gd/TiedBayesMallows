@@ -153,12 +153,24 @@ def mh_py_prior_reassign_one_item(
     delta: float,
     *,
     rng: random.Random,
+    blocks_old: Optional[List[List[int]]] = None,
+    distance_calculator=None,
+    use_parallel: bool = False,
+    posterior_cache: Optional[dict] = None,
 ) -> Tuple[List[List[int]], Optional[int], Optional[int]]:
     """MH update: remove a random item and reassign it using PY prior weights.
 
     The proposal ignores the likelihood (distance) term and samples new block
     placement according to the Pitman–Yor prior.  The acceptance probability is
     based solely on the ratio of posterior probabilities (likelihood+prior).
+
+    Parameters
+    ----------
+    posterior_cache : dict, optional
+        Cache mapping (blocks_tuple, theta, gamma, delta) → posterior_value.
+        If provided, lp_old will be retrieved from cache if blocks+params match,
+        avoiding redundant computation when parameters don't change between iterations.
+        The cache is updated in-place with lp_old for use in next iteration.
 
     Returns a tuple ``(blocks_out, n_proposals, n_accepts)`` as with other
     MH helpers.
@@ -210,17 +222,36 @@ def mh_py_prior_reassign_one_item(
         prop = apply_move_new_block(blocks_minus, x, pos)
 
     # compute MH acceptance based on full posterior
-    if profiler:
-        t_start = time.time()
-    lp_old = log_blocks_posterior(rankings_c, blocks, theta, gamma, delta)
-    if profiler:
-        profiler.record_operation("posterior_calculation", time.time() - t_start, "mh_py_reassign")
+    # OPTIMIZATION: Check posterior cache to avoid recalculation when theta/gamma/delta unchanged
+    cache_key = (tuple(tuple(b) for b in blocks), theta, gamma, delta)
+    if posterior_cache is not None and cache_key in posterior_cache:
+        lp_old = posterior_cache[cache_key]
+        if profiler:
+            profiler.record_operation("posterior_calculation (cached)", 0.0, "mh_py_reassign")
+    else:
+        if profiler:
+            t_start = time.time()
+        lp_old = log_blocks_posterior(rankings_c, blocks, theta, gamma, delta,
+                                      blocks_old=None, distance_calculator=None)
+        if profiler:
+            profiler.record_operation("posterior_calculation", time.time() - t_start, "mh_py_reassign")
+        # Store in cache for next iteration
+        if posterior_cache is not None:
+            posterior_cache[cache_key] = lp_old
     
     if profiler:
         t_start = time.time()
-    lp_new = log_blocks_posterior(rankings_c, prop, theta, gamma, delta)
+    lp_new = log_blocks_posterior(rankings_c, prop, theta, gamma, delta,
+                                  blocks_old=blocks, distance_calculator=distance_calculator,
+                                  parallel=use_parallel)
     if profiler:
         profiler.record_operation("posterior_calculation", time.time() - t_start, "mh_py_reassign")
+    
+    # Update cache with new state for next iteration if move accepted
+    # This will be overwritten if move is rejected, which is correct behavior
+    new_cache_key = (tuple(tuple(b) for b in prop), theta, gamma, delta)
+    if posterior_cache is not None:
+        posterior_cache[new_cache_key] = lp_new
     
     log_acc = lp_new - lp_old
     if math.log(rng.random()) < min(0.0, log_acc):
@@ -340,6 +371,10 @@ def mh_adjacent_item_transfer(
     delta: float,
     *,
     rng: random.Random,
+    blocks_old: Optional[List[List[int]]] = None,
+    distance_calculator=None,
+    use_parallel: bool = False,
+    posterior_cache: Optional[dict] = None,
 ) -> Tuple[List[List[int]], Optional[int], Optional[int]]:
     K = len(blocks)
     if K < 2:
@@ -366,17 +401,35 @@ def mh_adjacent_item_transfer(
     prop[recv].append(x)
 
     # compute likelihoods using Numba-optimized distance
-    if profiler:
-        t_start = time.time()
-    lp_old = log_blocks_posterior(rankings_c, blocks, theta, gamma, delta)
-    if profiler:
-        profiler.record_operation("posterior_calculation", time.time() - t_start, "mh_transfer")
+    # OPTIMIZATION: Check posterior cache to avoid recalculation when theta/gamma/delta unchanged
+    cache_key = (tuple(tuple(b) for b in blocks), theta, gamma, delta)
+    if posterior_cache is not None and cache_key in posterior_cache:
+        lp_old = posterior_cache[cache_key]
+        if profiler:
+            profiler.record_operation("posterior_calculation (cached)", 0.0, "mh_transfer")
+    else:
+        if profiler:
+            t_start = time.time()
+        lp_old = log_blocks_posterior(rankings_c, blocks, theta, gamma, delta,
+                                      blocks_old=None, distance_calculator=None)
+        if profiler:
+            profiler.record_operation("posterior_calculation", time.time() - t_start, "mh_transfer")
+        # Store in cache for next iteration
+        if posterior_cache is not None:
+            posterior_cache[cache_key] = lp_old
     
     if profiler:
         t_start = time.time()
-    lp_new = log_blocks_posterior(rankings_c, prop, theta, gamma, delta)
+    lp_new = log_blocks_posterior(rankings_c, prop, theta, gamma, delta,
+                                  blocks_old=blocks, distance_calculator=distance_calculator,
+                                  parallel=use_parallel)
     if profiler:
         profiler.record_operation("posterior_calculation", time.time() - t_start, "mh_transfer")
+    
+    # Update cache with new state for next iteration if move accepted
+    new_cache_key = (tuple(tuple(b) for b in prop), theta, gamma, delta)
+    if posterior_cache is not None:
+        posterior_cache[new_cache_key] = lp_new
 
     log_q_fwd = -math.log(len(moves)) - math.log(len(blocks[donor]))
 
@@ -435,6 +488,10 @@ def mh_ordering_swap_or_shift(
     p_short: float = 0.75,
     n_swap_steps: Optional[int] = None,
     max_long_step: Optional[int] = None,
+    blocks_old: Optional[List[List[int]]] = None,
+    distance_calculator=None,
+    use_parallel: bool = False,
+    posterior_cache: Optional[dict] = None,
 ) -> Tuple[List[List[int]], Optional[int], Optional[int]]:
     """
     Reorder blocks with minimal moves by default: 1 adjacent swap OR 1-position shift.
@@ -453,6 +510,12 @@ def mh_ordering_swap_or_shift(
         Maximum distance for shift moves. Default: 1 (adjacent positions only).
         Set to None for adaptive: min(K-1, K/2) [old behavior]
         Set explicitly for different ranges (e.g., 2 or 3 for wider exploration)
+    blocks_old : list of lists, optional
+        Previous block structure (enables incremental distance calculation)
+    distance_calculator : object, optional
+        IncrementalDistanceCalculator for fast incremental updates
+    use_parallel : bool
+        Use parallel computation for distance calculation
     """
     K = len(blocks)
     if K <= 1:
@@ -467,12 +530,21 @@ def mh_ordering_swap_or_shift(
 
     profiler = get_profiler()
 
-    # Profile posterior calculation (old)
-    if profiler:
-        t_start = time.time()
-    lp_old = log_blocks_posterior(rankings_c, blocks, theta, gamma, delta)
-    if profiler:
-        profiler.record_operation("posterior_calculation", time.time() - t_start, "mh_swapshift")
+    # Profile posterior calculation (old) - use cache to avoid recomputation
+    cache_key = (tuple(tuple(b) for b in blocks), theta, gamma, delta)
+    if posterior_cache is not None and cache_key in posterior_cache:
+        lp_old = posterior_cache[cache_key]
+        if profiler:
+            profiler.record_operation("posterior_calculation (cached)", 0.0, "mh_swapshift")
+    else:
+        if profiler:
+            t_start = time.time()
+        lp_old = log_blocks_posterior(rankings_c, blocks, theta, gamma, delta,
+                                      blocks_old=None, distance_calculator=None)
+        if profiler:
+            profiler.record_operation("posterior_calculation", time.time() - t_start, "mh_swapshift")
+        if posterior_cache is not None:
+            posterior_cache[cache_key] = lp_old
 
     if rng.random() < p_short:
         # Short move: adjacent swaps
@@ -484,9 +556,16 @@ def mh_ordering_swap_or_shift(
         # Profile posterior calculation (new - short swaps)
         if profiler:
             t_start = time.time()
-        lp_new = log_blocks_posterior(rankings_c, prop, theta, gamma, delta)
+        lp_new = log_blocks_posterior(rankings_c, prop, theta, gamma, delta,
+                                      blocks_old=blocks, distance_calculator=distance_calculator,
+                                      parallel=use_parallel)
         if profiler:
             profiler.record_operation("posterior_calculation", time.time() - t_start, "mh_swapshift")
+        
+        # Update cache for potential reuse
+        new_cache_key = (tuple(tuple(b) for b in prop), theta, gamma, delta)
+        if posterior_cache is not None:
+            posterior_cache[new_cache_key] = lp_new
         
         if math.log(rng.random()) < min(0.0, lp_new - lp_old):
             return prop, 1, 1
@@ -504,9 +583,16 @@ def mh_ordering_swap_or_shift(
     # Profile posterior calculation (new - long shift)
     if profiler:
         t_start = time.time()
-    lp_new = log_blocks_posterior(rankings_c, prop, theta, gamma, delta)
+    lp_new = log_blocks_posterior(rankings_c, prop, theta, gamma, delta,
+                                  blocks_old=blocks, distance_calculator=distance_calculator,
+                                  parallel=use_parallel)
     if profiler:
         profiler.record_operation("posterior_calculation", time.time() - t_start, "mh_swapshift")
+
+    # Update cache for potential reuse
+    new_cache_key = (tuple(tuple(b) for b in prop), theta, gamma, delta)
+    if posterior_cache is not None:
+        posterior_cache[new_cache_key] = lp_new
 
     feasible_rev = _feasible_shift_positions(K, j_to, max_long_step)
     if not feasible_rev:
