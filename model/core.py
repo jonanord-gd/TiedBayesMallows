@@ -979,7 +979,17 @@ class MixtureRankingModel:
         if self.samples is None:
             raise RuntimeError("Run run_mcmc(..., save_samples=True) first.")
 
-    def plot_trace_theta(self, *, burn: int = 0) -> None:
+    def plot_trace_theta(self, *, burn: int = 0, combined: bool = True) -> None:
+        """Plot theta trace for all clusters.
+        
+        Parameters
+        ----------
+        burn : int
+            Number of iterations to skip from the beginning
+        combined : bool
+            If True (default), plot all clusters on one figure with different colors.
+            If False, create separate figure for each cluster (old behavior).
+        """
         self._require_samples()
         import matplotlib.pyplot as plt
 
@@ -989,16 +999,39 @@ class MixtureRankingModel:
         T = len(self.samples.theta_samples)
         xs = list(range(burn, T))
 
-        for c in range(self.C):
-            ys = [self.samples.theta_samples[t][c] for t in xs]
-            plt.figure()
-            plt.plot(xs, ys)
-            plt.title(f"Theta trace (cluster {c})")
+        if combined:
+            plt.figure(figsize=(12, 5))
+            for c in range(self.C):
+                ys = [self.samples.theta_samples[t][c] for t in xs]
+                plt.plot(xs, ys, label=f"Cluster {c}", alpha=0.8)
+            plt.title("Theta trace (all clusters)")
             plt.xlabel("Saved iteration")
             plt.ylabel("theta")
+            plt.legend()
+            plt.grid(alpha=0.3)
+            plt.tight_layout()
             plt.show()
+        else:
+            for c in range(self.C):
+                ys = [self.samples.theta_samples[t][c] for t in xs]
+                plt.figure()
+                plt.plot(xs, ys)
+                plt.title(f"Theta trace (cluster {c})")
+                plt.xlabel("Saved iteration")
+                plt.ylabel("theta")
+                plt.show()
 
-    def plot_trace_tau(self, *, burn: int = 0) -> None:
+    def plot_trace_tau(self, *, burn: int = 0, combined: bool = True) -> None:
+        """Plot tau trace for all clusters.
+        
+        Parameters
+        ----------
+        burn : int
+            Number of iterations to skip from the beginning
+        combined : bool
+            If True (default), plot all clusters on one figure with different colors.
+            If False, create separate figure for each cluster (old behavior).
+        """
         self._require_samples()
         import matplotlib.pyplot as plt
 
@@ -1008,16 +1041,39 @@ class MixtureRankingModel:
         T = len(self.samples.tau_samples)
         xs = list(range(burn, T))
 
-        for c in range(self.C):
-            ys = [self.samples.tau_samples[t][c] for t in xs]
-            plt.figure()
-            plt.plot(xs, ys)
-            plt.title(f"Tau trace (cluster {c})")
+        if combined:
+            plt.figure(figsize=(12, 5))
+            for c in range(self.C):
+                ys = [self.samples.tau_samples[t][c] for t in xs]
+                plt.plot(xs, ys, label=f"Cluster {c}", alpha=0.8)
+            plt.title("Tau trace (all clusters)")
             plt.xlabel("Saved iteration")
             plt.ylabel("tau")
+            plt.legend()
+            plt.grid(alpha=0.3)
+            plt.tight_layout()
             plt.show()
+        else:
+            for c in range(self.C):
+                ys = [self.samples.tau_samples[t][c] for t in xs]
+                plt.figure()
+                plt.plot(xs, ys)
+                plt.title(f"Tau trace (cluster {c})")
+                plt.xlabel("Saved iteration")
+                plt.ylabel("tau")
+                plt.show()
 
-    def plot_trace_K(self, *, burn: int = 0) -> None:
+    def plot_trace_K(self, *, burn: int = 0, combined: bool = True) -> None:
+        """Plot number of blocks K trace for all clusters.
+        
+        Parameters
+        ----------
+        burn : int
+            Number of iterations to skip from the beginning
+        combined : bool
+            If True (default), plot all clusters on one figure with different colors.
+            If False, create separate figure for each cluster (old behavior).
+        """
         self._require_samples()
         import matplotlib.pyplot as plt
 
@@ -1026,16 +1082,30 @@ class MixtureRankingModel:
         T = len(self.samples.K)
         xs = list(range(burn, T))
 
-        for c in range(self.C):
-            ys = [self.samples.K[t][c] for t in xs]
-            plt.figure()
-            plt.plot(xs, ys)
-            plt.title(f"#Blocks K trace (cluster {c})")
+        if combined:
+            plt.figure(figsize=(12, 5))
+            for c in range(self.C):
+                ys = [self.samples.K[t][c] for t in xs]
+                plt.plot(xs, ys, label=f"Cluster {c}", alpha=0.8, marker='o', markersize=3)
+            plt.title("Number of blocks K trace (all clusters)")
             plt.xlabel("Saved iteration")
             plt.ylabel("K")
+            plt.legend()
+            plt.grid(alpha=0.3)
+            plt.tight_layout()
             plt.show()
+        else:
+            for c in range(self.C):
+                ys = [self.samples.K[t][c] for t in xs]
+                plt.figure()
+                plt.plot(xs, ys)
+                plt.title(f"#Blocks K trace (cluster {c})")
+                plt.xlabel("Saved iteration")
+                plt.ylabel("K")
+                plt.show()
 
     def plot_trace_logp(self, *, burn: int = 0) -> None:
+        """Plot log-joint probability trace."""
         self._require_samples()
         import matplotlib.pyplot as plt
 
@@ -1044,9 +1114,96 @@ class MixtureRankingModel:
         xs = list(range(burn, len(self.samples.logp)))
         ys = self.samples.logp[burn:]
 
-        plt.figure()
-        plt.plot(xs, ys)
-        plt.title("Log joint trace (unnormalized)")
+        plt.figure(figsize=(12, 5))
+        plt.plot(xs, ys, color='darkred', linewidth=1.5)
+        plt.title("Log-joint density trace")
         plt.xlabel("Saved iteration")
-        plt.ylabel("logp")
+        plt.ylabel("log p(data, z, tau, theta | ...)")
+        plt.grid(alpha=0.3)
+        plt.tight_layout()
         plt.show()
+
+    def plot_traces(self, *, burn: int = 0, include_logp: bool = True) -> None:
+        """Plot all traces together in a combined multi-panel figure.
+        
+        Creates a figure with:
+        - Row 1: Theta trace (all clusters)
+        - Row 2: Tau trace (all clusters) 
+        - Row 3: K trace (all clusters)
+        - Row 4: Log-joint trace (optional)
+        
+        Parameters
+        ----------
+        burn : int
+            Number of iterations to skip from the beginning
+        include_logp : bool
+            If True, include log-joint trace at bottom
+        """
+        self._require_samples()
+        import matplotlib.pyplot as plt
+
+        assert self.samples is not None
+        T_samples = len(self.samples.K) if self.samples.K else len(self.samples.theta_samples or [])
+        
+        n_rows = 4 if include_logp else 3
+        if self.samples.theta_samples is None:
+            n_rows -= 1
+        if self.samples.tau_samples is None:
+            n_rows -= 1
+
+        fig, axes = plt.subplots(n_rows, 1, figsize=(14, 3*n_rows))
+        if n_rows == 1:
+            axes = [axes]
+
+        xs = list(range(burn, T_samples))
+        row = 0
+
+        # Theta trace
+        if self.samples.theta_samples is not None:
+            ax = axes[row]
+            for c in range(self.C):
+                ys = [self.samples.theta_samples[t][c] for t in xs]
+                ax.plot(xs, ys, label=f"Cluster {c}", alpha=0.8)
+            ax.set_title("Theta trace", fontsize=12, fontweight='bold')
+            ax.set_ylabel("theta")
+            ax.legend(loc='best', fontsize=9)
+            ax.grid(alpha=0.3)
+            row += 1
+
+        # Tau trace
+        if self.samples.tau_samples is not None:
+            ax = axes[row]
+            for c in range(self.C):
+                ys = [self.samples.tau_samples[t][c] for t in xs]
+                ax.plot(xs, ys, label=f"Cluster {c}", alpha=0.8)
+            ax.set_title("Tau trace", fontsize=12, fontweight='bold')
+            ax.set_ylabel("tau")
+            ax.legend(loc='best', fontsize=9)
+            ax.grid(alpha=0.3)
+            row += 1
+
+        # K trace
+        ax = axes[row]
+        for c in range(self.C):
+            ys = [self.samples.K[t][c] for t in xs]
+            ax.plot(xs, ys, label=f"Cluster {c}", alpha=0.8, marker='o', markersize=3)
+        ax.set_title("Number of blocks K trace", fontsize=12, fontweight='bold')
+        ax.set_ylabel("K")
+        ax.legend(loc='best', fontsize=9)
+        ax.grid(alpha=0.3)
+        row += 1
+
+        # Log-joint trace
+        if include_logp and self.samples.logp is not None:
+            ax = axes[row]
+            ys = self.samples.logp[burn:]
+            ax.plot(xs, ys, color='darkred', linewidth=1.5)
+            ax.set_title("Log-joint density", fontsize=12, fontweight='bold')
+            ax.set_ylabel("log p")
+            ax.grid(alpha=0.3)
+            row += 1
+
+        axes[-1].set_xlabel("Saved iteration")
+        plt.tight_layout()
+        plt.show()
+
