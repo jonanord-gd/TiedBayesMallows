@@ -30,8 +30,9 @@ def build_log_qfactorials(n: int, q: float) -> List[float]:
 
 
 # internal cached computation when log_qfact is not provided
-@lru_cache(maxsize=None)
-def _log_Z_star_core(sizes_tuple: Tuple[int, ...], theta: float) -> float:
+# Note: tiePenaltyWeight is not cached to avoid cache invalidation issues
+# Use log_Z_star_from_sizes instead, which handles this properly
+def _log_Z_star_core(sizes_tuple: Tuple[int, ...], theta: float, tiePenaltyWeight: float = 1.0) -> float:
     # builds qfactorials internally; sizes_tuple is tuple of ints
     sizes = list(sizes_tuple)
     if theta <= 0:
@@ -43,13 +44,13 @@ def _log_Z_star_core(sizes_tuple: Tuple[int, ...], theta: float) -> float:
     logP = sum(math.lgamma(s + 1) for s in sizes)
 
     log_qfact = build_log_qfactorials(n, q)
-    return (-theta * Tm) + logP + (log_qfact[n] - sum(log_qfact[s] for s in sizes))
+    return (-theta * tiePenaltyWeight * Tm) + logP + (log_qfact[n] - sum(log_qfact[s] for s in sizes))
 
 
-def log_Z_star_from_sizes(sizes: List[int], theta: float, log_qfact: Optional[List[float]] = None) -> float:
-    # if caller didn't supply precomputed log_qfactorials, use cached core
+def log_Z_star_from_sizes(sizes: List[int], theta: float, log_qfact: Optional[List[float]] = None, tiePenaltyWeight: float = 1.0) -> float:
+    # if caller didn't supply precomputed log_qfactorials, use core with weight
     if log_qfact is None:
-        return _log_Z_star_core(tuple(sizes), theta)
+        return _log_Z_star_core(tuple(sizes), theta, tiePenaltyWeight)
 
     if theta <= 0:
         return float("-inf")
@@ -62,11 +63,11 @@ def log_Z_star_from_sizes(sizes: List[int], theta: float, log_qfact: Optional[Li
     if len(log_qfact) < n + 1:
         log_qfact = build_log_qfactorials(n, q)
 
-    return (-theta * Tm) + logP + (log_qfact[n] - sum(log_qfact[s] for s in sizes))
+    return (-theta * tiePenaltyWeight * Tm) + logP + (log_qfact[n] - sum(log_qfact[s] for s in sizes))
 
 
-def log_Z_star(blocks: List[List[int]], theta: float) -> float:
-    return log_Z_star_from_sizes([len(b) for b in blocks], theta, None)
+def log_Z_star(blocks: List[List[int]], theta: float, tiePenaltyWeight: float = 1.0) -> float:
+    return log_Z_star_from_sizes([len(b) for b in blocks], theta, None, tiePenaltyWeight)
 
 
 def log_py_eppf_from_sizes(sizes: List[int], gamma: float, delta: float) -> float:
@@ -107,6 +108,7 @@ def log_blocks_posterior(
     blocks_old: Optional[List[List[int]]] = None,
     distance_calculator=None,
     parallel: bool = False,
+    tiePenaltyWeight: float = 1.0,
 ) -> float:
     """
     Compute log posterior of blocks given cluster rankings.
@@ -145,19 +147,19 @@ def log_blocks_posterior(
     
     if distance_calculator is not None and blocks_old is not None:
         # Use incremental calculation with smart heuristic
-        S = distance_calculator.compute_distance_with_heuristic(blocks_old, blocks, parallel=parallel)
+        S = distance_calculator.compute_distance_with_heuristic(blocks_old, blocks, parallel=parallel, tiePenaltyWeight=tiePenaltyWeight)
         if profiler:
             profiler.record_operation("distance_calculation_incremental", time.time() - t_start)
     else:
         # Standard full calculation
-        S = total_distance_fast(rankings_c, blocks)
+        S = total_distance_fast(rankings_c, blocks, tiePenaltyWeight=tiePenaltyWeight)
         if profiler:
             profiler.record_operation("distance_calculation", time.time() - t_start)
     
     # Z* calculation
     if profiler:
         t_start = time.time()
-    logZ = log_Z_star_from_sizes(sizes, theta, None)
+    logZ = log_Z_star_from_sizes(sizes, theta, None, tiePenaltyWeight)
     if profiler:
         profiler.record_operation("z_star_calculation", time.time() - t_start)
     

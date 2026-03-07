@@ -67,3 +67,10 @@ class SamplerConfig:
     a_theta: float = 2.0            # shape of Gamma prior on theta
     b_theta: float = 1.0            # rate of Gamma prior on theta
     theta_step: float = 0.25        # log-normal proposal stddev for theta updates
+
+    # Tie penalty weight (affects influence of T_m in distance calculations)
+    # Default 1.0; can be adjusted between 0 (exclusive) and 2 (exclusive)
+    # Higher values penalize ties more heavily in the Mallows model
+    tiePenaltyWeight: float = 1.0   # multiplier for T_m in d_ic = 2*disc + tiePenaltyWeight*T_m
+    # Debugging flag: disable incremental distance calculation (for validation)
+    use_incremental_distance: bool = True  # Set to False to use only full distance calculation

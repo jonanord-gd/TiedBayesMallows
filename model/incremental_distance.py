@@ -88,7 +88,8 @@ class IncrementalDistanceCalculator:
         blocks: List[List[int]],
         Tm: Optional[int] = None,
         parallel: bool = False,
-        n_jobs: int = -1
+        n_jobs: int = -1,
+        tiePenaltyWeight: float = 1.0
     ) -> int:
         """Compute total distance from scratch (full calculation).
         
@@ -102,11 +103,13 @@ class IncrementalDistanceCalculator:
             Use parallel computation for rankings (beneficial when N > 100)
         n_jobs : int
             Number of parallel jobs (-1 = all cores)
+        tiePenaltyWeight : float
+            Multiplier for Tm in distance calculation (default 1.0)
         
         Returns
         -------
         total_distance : int
-            Sum of 2*disc_i + Tm over all rankings.
+            Sum of 2*disc_i + tiePenaltyWeight*Tm over all rankings.
         """
         profiler = get_profiler()
         t_start = time.time() if profiler else None
@@ -115,25 +118,27 @@ class IncrementalDistanceCalculator:
             from .blocks import T_of_blocks
             Tm = T_of_blocks(blocks)
         
+        weighted_Tm = tiePenaltyWeight * Tm
+        
         # Build block index
         block_idx = blocks_to_block_index(blocks, self.n, validate=False)
         K = len(blocks)
         
         if parallel and _USE_JOBLIB and self.N > 50:
             # Parallel computation for large datasets
-            def _compute_ranking_distance(ranking, block_idx, K, Tm):
+            def _compute_ranking_distance(ranking, block_idx, K, weighted_Tm):
                 disc = cross_block_disagreements_fast(ranking, block_idx, K)
-                return 2 * disc + Tm
+                return 2 * disc + weighted_Tm
             
             distances = Parallel(n_jobs=n_jobs, backend='threading')(
-                delayed(_compute_ranking_distance)(ranking, block_idx, K, Tm)
+                delayed(_compute_ranking_distance)(ranking, block_idx, K, weighted_Tm)
                 for ranking in self.rankings
             )
             total = sum(distances)
             
             # Update caches
             for i, distance in enumerate(distances):
-                disc = (distance - Tm) // 2
+                disc = (distance - weighted_Tm) / 2
                 self.caches[i].blocks_tuple = AssessmentCache._blocks_to_tuple(blocks)
                 self.caches[i].disagreement = disc
                 self.caches[i].changed_items.clear()
@@ -142,7 +147,7 @@ class IncrementalDistanceCalculator:
             total = 0
             for i, ranking in enumerate(self.rankings):
                 disc = cross_block_disagreements_fast(ranking, block_idx, K)
-                total += 2 * disc + Tm
+                total += 2 * disc + weighted_Tm
                 
                 # Update cache
                 self.caches[i].blocks_tuple = AssessmentCache._blocks_to_tuple(blocks)
@@ -166,7 +171,8 @@ class IncrementalDistanceCalculator:
         changed_items: set,
         Tm_new: int,
         parallel: bool = False,
-        n_jobs: int = -1
+        n_jobs: int = -1,
+        tiePenaltyWeight: float = 1.0
     ) -> int:
         """
         Compute distance using incremental calculation for changed items.
@@ -188,6 +194,8 @@ class IncrementalDistanceCalculator:
             Use parallel computation for rankings (beneficial when N > 100)
         n_jobs : int
             Number of parallel jobs (-1 = all cores)
+        tiePenaltyWeight : float
+            Multiplier for Tm in distance calculation (default 1.0)
         
         Returns
         -------
@@ -196,13 +204,16 @@ class IncrementalDistanceCalculator:
         """
         if not changed_items:
             # No items changed, return cached values
+            weighted_Tm_new = tiePenaltyWeight * Tm_new
             return sum(
-                2 * cache.disagreement + Tm_new 
+                2 * cache.disagreement + weighted_Tm_new 
                 for cache in self.caches
             )
         
         profiler = get_profiler()
         t_start = time.time() if profiler else None
+        
+        weighted_Tm_new = tiePenaltyWeight * Tm_new
         
         # Build block indices
         block_idx_old = blocks_to_block_index(blocks_old, self.n, validate=False)
@@ -225,7 +236,7 @@ class IncrementalDistanceCalculator:
                 for i, ranking in enumerate(self.rankings)
             )
             
-            total = sum(2 * d + Tm_new for d in new_discs)
+            total = sum(2 * d + weighted_Tm_new for d in new_discs)
             
             # Update caches
             for i, new_disc in enumerate(new_discs):
@@ -250,7 +261,7 @@ class IncrementalDistanceCalculator:
                 )
                 
                 new_disc = old_disc + delta
-                total += 2 * new_disc + Tm_new
+                total += 2 * new_disc + weighted_Tm_new
                 
                 # Update cache
                 self.caches[i].blocks_tuple = AssessmentCache._blocks_to_tuple(blocks_new)
@@ -281,7 +292,8 @@ class IncrementalDistanceCalculator:
         blocks_old: List[List[int]],
         blocks_new: List[List[int]],
         parallel: bool = False,
-        n_jobs: int = -1
+        n_jobs: int = -1,
+        tiePenaltyWeight: float = 1.0
     ) -> int:
         """
         Intelligently choose between incremental and full calculation.
@@ -301,6 +313,8 @@ class IncrementalDistanceCalculator:
             Use parallel computation when beneficial
         n_jobs : int
             Number of parallel jobs
+        tiePenaltyWeight : float
+            Multiplier for Tm in distance calculation (default 1.0)
         
         Returns
         -------
@@ -308,7 +322,7 @@ class IncrementalDistanceCalculator:
         """
         if blocks_old is None:
             from .blocks import T_of_blocks
-            return self.compute_distance(blocks_new, T_of_blocks(blocks_new))
+            return self.compute_distance(blocks_new, T_of_blocks(blocks_new), tiePenaltyWeight=tiePenaltyWeight)
         
         # Compute changed items
         from .blocks import blocks_to_block_index
@@ -327,13 +341,13 @@ class IncrementalDistanceCalculator:
         if pct_changed > 0.3:
             # Too many changes, do full recompute
             from .blocks import T_of_blocks
-            return self.compute_distance(blocks_new, T_of_blocks(blocks_new), parallel=parallel, n_jobs=n_jobs)
+            return self.compute_distance(blocks_new, T_of_blocks(blocks_new), parallel=parallel, n_jobs=n_jobs, tiePenaltyWeight=tiePenaltyWeight)
         
         # Use incremental
         from .blocks import T_of_blocks
         return self.compute_distance_incremental(
             blocks_old, blocks_new, changed_items,
-            T_of_blocks(blocks_new), parallel=parallel, n_jobs=n_jobs
+            T_of_blocks(blocks_new), parallel=parallel, n_jobs=n_jobs, tiePenaltyWeight=tiePenaltyWeight
         )
     
     def _compute_inversion_delta(

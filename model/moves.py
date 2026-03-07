@@ -46,7 +46,8 @@ def gibbs_reassign_one_item(
     gamma: float,
     delta: float,
     include_uniform_order_prior: bool = True,
-    rng: Optional[random.Random] = None
+    rng: Optional[random.Random] = None,
+    tiePenaltyWeight: float = 1.0
 ) -> List[List[int]]:
     if rng is None:
         rng = random.Random()
@@ -76,7 +77,7 @@ def gibbs_reassign_one_item(
         # Profile distance calculation
         if profiler:
             t_start = time.time()
-        S = total_distance_fast(rankings, prop)
+        S = total_distance_fast(rankings, prop, tiePenaltyWeight=tiePenaltyWeight)
         if profiler:
             profiler.record_operation("distance_calculation", time.time() - t_start, "gibbs_reassign")
         
@@ -86,7 +87,7 @@ def gibbs_reassign_one_item(
         # Profile Z* calculation
         if profiler:
             t_start = time.time()
-        logZ = log_Z_star_from_sizes(sizes_cand, theta, None)
+        logZ = log_Z_star_from_sizes(sizes_cand, theta, None, tiePenaltyWeight=tiePenaltyWeight)
         if profiler:
             profiler.record_operation("z_star_calculation", time.time() - t_start, "gibbs_reassign")
 
@@ -105,7 +106,7 @@ def gibbs_reassign_one_item(
             # Profile distance calculation
             if profiler:
                 t_start = time.time()
-            S = total_distance_fast(rankings, prop)
+            S = total_distance_fast(rankings, prop, tiePenaltyWeight=tiePenaltyWeight)
             if profiler:
                 profiler.record_operation("distance_calculation", time.time() - t_start, "gibbs_reassign")
             
@@ -116,7 +117,7 @@ def gibbs_reassign_one_item(
             # Profile Z* calculation
             if profiler:
                 t_start = time.time()
-            logZ = log_Z_star_from_sizes(sizes_cand, theta, None)
+            logZ = log_Z_star_from_sizes(sizes_cand, theta, None, tiePenaltyWeight=tiePenaltyWeight)
             if profiler:
                 profiler.record_operation("z_star_calculation", time.time() - t_start, "gibbs_reassign")
 
@@ -186,7 +187,7 @@ def mh_py_prior_reassign_one_item(
     # pick a random item and remove it
     n = len(rankings_c[0])
     x = rng.randrange(n)
-    blocks_minus, old_blk = remove_item_from_blocks(blocks, x)
+    blocks_minus, _ = remove_item_from_blocks(blocks, x)
     K_minus = len(blocks_minus)
     sizes_minus = [len(b) for b in blocks_minus]
 
@@ -231,8 +232,10 @@ def mh_py_prior_reassign_one_item(
     else:
         if profiler:
             t_start = time.time()
+        # Use distance_calculator consistently for both old and new
+        # blocks_old=None ensures full distance calculation (no incremental for baseline)
         lp_old = log_blocks_posterior(rankings_c, blocks, theta, gamma, delta,
-                                      blocks_old=None, distance_calculator=None)
+                                      blocks_old=None, distance_calculator=distance_calculator, parallel=use_parallel)
         if profiler:
             profiler.record_operation("posterior_calculation", time.time() - t_start, "mh_py_reassign")
         # Store in cache for next iteration
@@ -241,9 +244,9 @@ def mh_py_prior_reassign_one_item(
     
     if profiler:
         t_start = time.time()
+    # Use distance_calculator consistently; blocks_old allows incremental if beneficial
     lp_new = log_blocks_posterior(rankings_c, prop, theta, gamma, delta,
-                                  blocks_old=blocks, distance_calculator=distance_calculator,
-                                  parallel=use_parallel)
+                                  blocks_old=blocks, distance_calculator=distance_calculator, parallel=use_parallel)
     if profiler:
         profiler.record_operation("posterior_calculation", time.time() - t_start, "mh_py_reassign")
     
@@ -254,7 +257,7 @@ def mh_py_prior_reassign_one_item(
         posterior_cache[new_cache_key] = lp_new
     
     log_acc = lp_new - lp_old
-    if math.log(rng.random()) < min(0.0, log_acc):
+    if math.log(rng.random()) < log_acc:
         return prop, 1, 1
     return blocks, 1, 0
 
@@ -358,7 +361,7 @@ def mh_adjacent_split_merge(
         log_q_bwd = math.log(p_merge) + math.log(1.0 / (K2 - 1))
 
     log_acc = (lp_new - lp_old) + (log_q_bwd - log_q_fwd)
-    if math.log(rng.random()) < min(0.0, log_acc):
+    if math.log(rng.random()) <log_acc:
         return prop, 1, 1
     return blocks, 1, 0
 
@@ -447,7 +450,7 @@ def mh_adjacent_item_transfer(
     log_q_bwd = -math.log(len(moves2)) - math.log(len(prop[rev_donor]))
 
     log_acc = (lp_new - lp_old) + (log_q_bwd - log_q_fwd)
-    if math.log(rng.random()) < min(0.0, log_acc):
+    if math.log(rng.random()) < log_acc:
         return prop, 1, 1
     return blocks, 1, 0
 
@@ -567,7 +570,7 @@ def mh_ordering_swap_or_shift(
         if posterior_cache is not None:
             posterior_cache[new_cache_key] = lp_new
         
-        if math.log(rng.random()) < min(0.0, lp_new - lp_old):
+        if math.log(rng.random()) < (lp_new - lp_old):
             return prop, 1, 1
         return blocks, 1, 0
 
@@ -602,6 +605,6 @@ def mh_ordering_swap_or_shift(
     log_q_bwd = math.log(1.0 - p_short) - math.log(K) - math.log(len(feasible_rev))
 
     log_acc = (lp_new - lp_old) + (log_q_bwd - log_q_fwd)
-    if math.log(rng.random()) < min(0.0, log_acc):
+    if math.log(rng.random()) < log_acc:
         return prop, 1, 1
     return blocks, 1, 0
