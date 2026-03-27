@@ -1084,7 +1084,7 @@ class MixtureRankingModel:
 
     def acceptance_statistics(self, parameter: Optional[str] = None) -> Dict[str, Any]:
         """Compute acceptance statistics after a run."""
-        from AcceptanceProbabilities import acceptance_probabilities
+        from .acceptance import acceptance_probabilities
 
         if self.samples is None:
             raise RuntimeError("No samples available. Run run_mcmc() first with save_samples=True.")
@@ -1093,7 +1093,7 @@ class MixtureRankingModel:
 
     def print_acceptance_summary(self) -> None:
         """Print a human-readable acceptance summary to stdout."""
-        from AcceptanceProbabilities import print_acceptance_summary
+        from .acceptance import print_acceptance_summary
 
         if self.samples is None:
             raise RuntimeError("No samples available. Run run_mcmc() first with save_samples=True.")

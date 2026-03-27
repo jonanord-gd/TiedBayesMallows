@@ -20,6 +20,7 @@ from .initialization import init_spectral_with_z, init_clusters_default
 from .moves import fast_gibbs_reassign_one_item, icm_sweep_cluster
 from .utils import logsumexp, sample_categorical_from_logweights, dirichlet_sample
 from .profiling import enable_profiling, disable_profiling, get_profiler, reset_profiling, MCMCProfiler
+from .acceptance import acceptance_probabilities, print_acceptance_summary
 
 __all__ = [
     "MixtureRankingModel",
@@ -41,5 +42,7 @@ __all__ = [
     "get_profiler",
     "reset_profiling",
     "MCMCProfiler",
+    "acceptance_probabilities",
+    "print_acceptance_summary",
 ]
 

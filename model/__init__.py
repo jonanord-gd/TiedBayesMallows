@@ -21,6 +21,8 @@ from .TiedMallowsModel import (
     get_profiler,
     reset_profiling,
     MCMCProfiler,
+    acceptance_probabilities,
+    print_acceptance_summary,
 )
 
 __all__ = [
@@ -43,4 +45,6 @@ __all__ = [
     "get_profiler",
     "reset_profiling",
     "MCMCProfiler",
+    "acceptance_probabilities",
+    "print_acceptance_summary",
 ]
