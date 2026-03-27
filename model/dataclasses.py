@@ -39,38 +39,18 @@ class MCMCSamples:
 
 @dataclass
 class SamplerConfig:
-    n_item_moves_per_cluster: int = 2   # number of item-level PY moves to attempt per cluster each iteration
+    n_item_moves_per_cluster: int = 2   # number of Gibbs item moves to attempt per cluster each iteration
 
-    # PY prior parameters used by the various block moves.  Clusters have
-    # their own `gamma`/`delta` fields, but setting these values here overrides
-    # them for every cluster (with ``None`` meaning "use the cluster value").
-    gamma: Optional[float] = None   # Pitman–Yor discount parameter (0<=delta<1)
-    delta: Optional[float] = None   # Pitman–Yor strength/concentration parameter
+    # PY prior parameters. Clusters have their own `gamma`/`delta` fields, but
+    # setting these here overrides all clusters (None = use each cluster's value).
+    gamma: Optional[float] = None   # Pitman-Yor discount parameter (0 <= delta < 1)
+    delta: Optional[float] = None   # Pitman-Yor strength/concentration parameter
 
-    # mixture weights for the five block-update types; they are normalized
-    # internally so only their ratios matter.
-    p_gibbs_reassign: float = 0.0   # probability of Gibbs reassign-one-item move
-    p_transfer: float = 0.4         # probability of adjacent-item-transfer move
-    p_swapshift: float = 0.4        # probability of ordering swap/shift move
-    p_splitmerge: float = 0.2       # probability of adjacent split/merge move
-    p_reassign: float = 0.0         # probability of PY-prior MH single-item reassign move
-
-    # parameters specific to the ordering swap/shift move
-    ordering_p_short: float = 0.75   # chance of proposing a "short" swap vs long shift
-    ordering_n_swap_steps: Optional[int] = None  # max number of random swap steps when using short move
-    ordering_max_long_step: Optional[int] = None  # max displacement for long shift move
-
-    # parameter for split/merge move probability of proposing merge given a split choice
-    splitmerge_p_merge: float = 0.5
-
-    # Metropolis–Hastings parameters for updating theta
+    # Metropolis-Hastings parameters for updating theta
     a_theta: float = 2.0            # shape of Gamma prior on theta
     b_theta: float = 1.0            # rate of Gamma prior on theta
     theta_step: float = 0.25        # log-normal proposal stddev for theta updates
 
-    # Tie penalty weight (affects influence of T_m in distance calculations)
-    # Default 1.0; can be adjusted between 0 (exclusive) and 2 (exclusive)
-    # Higher values penalize ties more heavily in the Mallows model
-    tiePenaltyWeight: float = 1.0   # multiplier for T_m in d_ic = 2*disc + tiePenaltyWeight*T_m
-    # Debugging flag: disable incremental distance calculation (for validation)
-    use_incremental_distance: bool = True  # Set to False to use only full distance calculation
+    # Tie penalty weight: the p in the K^(p) extended Kendall distance.
+    # p=0.5 gives the standard Kemeny distance. Must be in (0, 1].
+    tie_penalty: float = 0.5

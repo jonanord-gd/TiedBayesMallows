@@ -85,11 +85,11 @@ def total_distance_given_block_index(
     block_index_fn: Callable[[int], int],
     K: int,
     Tm: int,
-    tiePenaltyWeight: float = 1.0
+    tie_penalty: float = 0.5
 ) -> int:
-    """Compute sum_i (2*disc_i + tiePenaltyWeight*Tm) with disc_i via inversion count."""
+    """Compute sum_i (disc_i + tie_penalty*Tm) with disc_i via inversion count."""
     total = 0
-    weighted_Tm = tiePenaltyWeight * Tm
+    weighted_Tm = tie_penalty * Tm
     for r in rankings:
         fw = Fenwick(K)
         seen = 0
@@ -100,11 +100,11 @@ def total_distance_given_block_index(
             inv += seen - leq
             fw.add(b, 1)
             seen += 1
-        total += 2 * inv + weighted_Tm
+        total += inv + weighted_Tm
     return total
 
 
-def total_distance_fast(rankings: List[List[int]], blocks: List[List[int]], tiePenaltyWeight: float = 1.0) -> int:
+def total_distance_fast(rankings: List[List[int]], blocks: List[List[int]], tie_penalty: float = 0.5) -> int:
     """Sum_i d(r_i, blocks). Uses inversion counting (O(N n log K)).
 
     A numba-accelerated variant is used when available, which speeds the
@@ -114,7 +114,7 @@ def total_distance_fast(rankings: List[List[int]], blocks: List[List[int]], tieP
     Distance computation breakdown:
     - Block index creation: Maps items to block IDs (O(n))
     - Per-ranking inversion counting: For each ranking, count disagreements using Fenwick tree (O(n log K) * N)
-    - Tm penalty: Within-block penalty term (O(K)) scaled by tiePenaltyWeight
+    - Tm penalty: Within-block penalty term (O(K)) scaled by tie_penalty
     
     Parameters
     ----------
@@ -122,9 +122,10 @@ def total_distance_fast(rankings: List[List[int]], blocks: List[List[int]], tieP
         Rankings to compute distance for
     blocks : list of lists  
         Block structure
-    tiePenaltyWeight : float, default=1.0
-        Weight for the within-block penalty term (Tm). Must match the weight used
-        in the likelihood calculation for consistency.
+    tie_penalty : float, default=0.5
+        Weight for the within-block penalty term (Tm). The p in K^(p) extended Kendall distance
+        (p=0.5 recovers Kemeny distance). Must match the weight used in the likelihood calculation
+        for consistency. Distance formula: sum_i (inversions_i + tie_penalty*Tm).
     """
     if not rankings:
         return 0
@@ -148,7 +149,7 @@ def total_distance_fast(rankings: List[List[int]], blocks: List[List[int]], tieP
     if profiler:
         t_start = time.time()
     Tm = T_of_sizes(sizes)
-    weighted_Tm = tiePenaltyWeight * Tm  # Apply weight to within-block penalty
+    weighted_Tm = tie_penalty * Tm  # Apply weight to within-block penalty
     if profiler:
         profiler.record_operation("within_block_penalty_calc", time.time() - t_start)
 
@@ -160,7 +161,7 @@ def total_distance_fast(rankings: List[List[int]], blocks: List[List[int]], tieP
         total = 0
         for r in rankings:
             inv = _cross_block_disagreements_fast_nb(r, blk, K)
-            total += 2 * inv + weighted_Tm
+            total += inv + weighted_Tm
         if profiler:
             profiler.record_operation("inversion_counting_all_rankings", time.time() - t_start)
         return total
@@ -171,7 +172,7 @@ def total_distance_fast(rankings: List[List[int]], blocks: List[List[int]], tieP
     total = 0
     for r in rankings:
         disc = cross_block_disagreements_fast(r, blk, K)
-        total += 2 * disc + weighted_Tm
+        total += disc + weighted_Tm
     if profiler:
         profiler.record_operation("inversion_counting_all_rankings", time.time() - t_start)
     return total

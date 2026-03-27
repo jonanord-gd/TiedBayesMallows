@@ -25,19 +25,18 @@ from .summaries import (
     summarize_theta,
 )
 from .utils import dirichlet_sample, sample_categorical_from_logweights
-from .initialization import init_blocks_borda_threshold
 from .blocks import T_of_sizes, blocks_to_block_index
-from .distance import cross_block_disagreements_fast, total_distance_fast
-from .incremental_distance import IncrementalDistanceCalculator
+from .distance import total_distance_fast
 from .priors import log_Z_star_from_sizes, log_py_eppf_from_sizes, log_blocks_posterior
-from .moves import (
-    gibbs_reassign_one_item,
-    mh_adjacent_item_transfer,
-    mh_adjacent_split_merge,
-    mh_ordering_swap_or_shift,
-    mh_py_prior_reassign_one_item,
-)
 from .profiling import get_profiler
+from .moves import (
+    compute_U_all,
+    build_cluster_pair_masks,
+    compute_all_disagreements_fast,
+    fast_gibbs_reassign_one_item,
+    icm_sweep_cluster,
+)
+from .priors import build_log_qfactorials
 
 # Numba support
 try:
@@ -63,10 +62,11 @@ class MixtureRankingModel:
         init_clusters: Optional[List[ClusterParams]] = None,
         n_clusters: Optional[int] = None,
         init_mu: Optional[List[float]] = None,
+        init_z: Optional[List[int]] = None,
         init_theta: Optional[float] = None,
         init_gamma: Optional[float] = None,
         init_delta: Optional[float] = None,
-        borda_gap_threshold: float = 0.35,
+        use_spectral_init: bool = False,
         seed: int = 123,
         verbose: bool = False,
         parallel_threshold_n: Optional[int] = None,
@@ -88,24 +88,35 @@ class MixtureRankingModel:
         init_mu : list of float, optional
             Dirichlet prior parameters for the cluster weights. If omitted a
             symmetric prior with all entries 1.0 is used.
+        init_z : list of int, optional
+            Initial cluster assignments for each ranking (z[i] = cluster for ranking i).
+            If provided, tau is derived from the frequency of assignments in z.
+            If omitted, z is randomly assigned and tau is sampled from Dirichlet.
+            
+            Use with init_spectral_with_z() to intelligently initialize from spectral clustering:
+            ```
+            clusters, z = init_spectral_with_z(rankings, n_clusters=C, seed=123)
+            model = MixtureRankingModel(rankings, init_clusters=clusters, init_z=z)
+            ```
         init_theta : float, optional
             Initial theta value for all clusters. If given, overrides cluster values.
         init_gamma : float, optional
             Common PY gamma to use for all clusters.
         init_delta : float, optional
             Common PY delta to use for all clusters.
-        borda_gap_threshold : float, default=0.35
-            Threshold for creating blocks in Borda-derived initial rankings.
-            Items with position differences <= this threshold are grouped in the same block.
-            Only used when init_clusters is None.
-            
-            - Smaller values (0.2-0.3): More blocks (K closer to n)
-            - Medium values (0.5-1.0): Moderate blocks (recommended)
-            - Larger values (>1.0): Fewer, larger blocks
-            
-            Tip: To get reasonable block structures instead of all items in separate blocks,
-            try values like 0.5, 1.0, or 1.5. Combined with the new cluster initialization,
-            each cluster will have a different block structure.
+        use_spectral_init : bool, default=False
+            When ``init_clusters`` is not provided and ``n_clusters`` is given,
+            choose the auto-initialization strategy:
+
+            * ``False`` (default): trivial init — each cluster starts with all
+              items in one block. Fast and cheap; the Gibbs moves will build
+              structure from scratch. Good for exploratory runs.
+            * ``True``: run spectral clustering on the rankings to form initial
+              clusters. Slower startup but produces better-structured initial
+              blocks. Recommended for production runs.
+
+            In both cases a ``UserWarning`` is raised to remind you to consider
+            providing ``init_clusters`` explicitly via ``init_spectral_with_z()``.
         seed : int
             Random seed for reproducibility.
         verbose : bool
@@ -125,7 +136,7 @@ class MixtureRankingModel:
             - N > 300: parallel_threshold_n=300
             
         """
-        if not rankings:
+        if len(rankings) == 0:
             raise ValueError("rankings must be non-empty")
         self.rankings = rankings
         self.N = len(rankings)
@@ -137,46 +148,46 @@ class MixtureRankingModel:
 
         # Auto-generate clusters if not provided
         if init_clusters is None:
+            import warnings
             if n_clusters is None:
-                raise ValueError("Either init_clusters or n_clusters must be provided")
-            if n_clusters <= 0:
-                raise ValueError("n_clusters must be positive")
-            
-            # Generate per-cluster block rankings via Borda consensus with variation
-            cluster_blocks_list = init_blocks_borda_threshold(
-                rankings,
-                n_clusters,
-                gap_threshold=borda_gap_threshold,
-                rng=self.rng,
-            )
-            
-            # Set default values for theta, gamma, delta
-            theta_val = init_theta if init_theta is not None else 1.0
-            gamma_val = init_gamma if init_gamma is not None else 1.0
-            delta_val = init_delta if init_delta is not None else 0.5
-            
-            init_clusters = [
-                ClusterParams(
-                    blocks=cluster_blocks_list[c],
-                    theta=theta_val,
-                    gamma=gamma_val,
-                    delta=delta_val,
+                raise ValueError(
+                    "n_clusters must be provided when init_clusters is not given."
                 )
-                for c in range(n_clusters)
-            ]
+            warnings.warn(
+                "init_clusters not provided. For best results supply them via "
+                "init_spectral_with_z(rankings, n_clusters=C, seed=...). "
+                "Falling back to " + ("spectral" if use_spectral_init else "trivial") + " initialization.",
+                UserWarning,
+                stacklevel=2,
+            )
+            if use_spectral_init:
+                from .initialization import init_spectral_with_z
+                init_clusters, _auto_z = init_spectral_with_z(
+                    rankings, n_clusters=n_clusters, seed=seed)
+            else:
+                from .initialization import init_clusters_default
+                init_clusters, _auto_z = init_clusters_default(
+                    rankings, n_clusters,
+                    init_theta=init_theta or 1.0,
+                    init_gamma=init_gamma or 1.0,
+                    init_delta=init_delta or 0.5,
+                    seed=seed,
+                )
+            if init_z is None:
+                init_z = _auto_z
         else:
-            # Use provided clusters
             if n_clusters is not None:
                 raise ValueError("Cannot specify both init_clusters and n_clusters")
-            # Apply any overrides to the provided clusters
-            if init_theta is not None or init_gamma is not None or init_delta is not None:
-                for cl in init_clusters:
-                    if init_theta is not None:
-                        cl.theta = init_theta
-                    if init_gamma is not None:
-                        cl.gamma = init_gamma
-                    if init_delta is not None:
-                        cl.delta = init_delta
+
+        # Apply any parameter overrides to provided clusters
+        if init_theta is not None or init_gamma is not None or init_delta is not None:
+            for cl in init_clusters:
+                if init_theta is not None:
+                    cl.theta = init_theta
+                if init_gamma is not None:
+                    cl.gamma = init_gamma
+                if init_delta is not None:
+                    cl.delta = init_delta
 
         self.C = len(init_clusters)
         if self.C <= 0:
@@ -186,17 +197,40 @@ class MixtureRankingModel:
         if len(self.init_mu) != self.C:
             raise ValueError("init_mu must have length C")
 
-        # state
-        z0 = [self.rng.randrange(self.C) for _ in range(self.N)]
-        tau0 = dirichlet_sample(self.init_mu, self.rng)
+        # Initialize z and tau
+        if init_z is not None:
+            # Use provided cluster assignments
+            if len(init_z) != self.N:
+                raise ValueError(f"init_z must have length N={self.N}, got {len(init_z)}")
+            if any(z < 0 or z >= self.C for z in init_z):
+                raise ValueError(f"init_z values must be in range [0, {self.C-1}]")
+            
+            z0 = list(init_z)  # Copy the provided z
+            
+            # Compute tau from frequency of assignments in z
+            # tau[c] = (count of c in z) / N
+            tau0 = [0.0] * self.C
+            for z_i in z0:
+                tau0[z_i] += 1.0
+            tau0 = [t / self.N for t in tau0]
+        else:
+            # Random initialization
+            z0 = [self.rng.randrange(self.C) for _ in range(self.N)]
+            tau0 = dirichlet_sample(self.init_mu, self.rng)
+        
         self.state = MixtureState(clusters=init_clusters, z=z0, tau=tau0)
 
         # per-cluster caches (updated when blocks change)
         self._rebuild_all_cluster_caches()
-        
-        # Incremental distance calculator for efficient block updates
-        from .incremental_distance import IncrementalDistanceCalculator
-        self.dist_calculator = IncrementalDistanceCalculator(rankings)
+
+        # Precompute per-assessor pairwise preference matrix (O(N n^2), done once)
+        self._U_all = compute_U_all(rankings, self.n)
+
+        # Precompute initial M / offsets for all clusters (cached across iterations)
+        block_idx_list = [self._cache[c].block_idx for c in range(self.C)]
+        self._M, self._offsets = build_cluster_pair_masks(block_idx_list, self.n)
+        self._M_dirty = [False] * self.C
+        self._triu_indices = np.triu_indices(self.n, k=1)  # reused every rebuild
 
         # Initiate samples from MCMC run
         self.samples: Optional[MCMCSamples] = None
@@ -239,259 +273,92 @@ class MixtureRankingModel:
         self._cache[c] = MixtureRankingModel._ClusterCache(
             sizes=sizes, K=K, Tm=Tm, block_idx=blk
         )
+        # Mark M row as dirty so _compute_all_disagreements rebuilds it
+        if hasattr(self, '_M_dirty'):
+            self._M_dirty[c] = True
 
     def _rebuild_all_cluster_caches(self) -> None:
         self._cache: List[MixtureRankingModel._ClusterCache] = [None] * self.C  # type: ignore
         for c in range(self.C):
             self._rebuild_cluster_cache(c)
     
-    @staticmethod
-    def _compute_changed_items(blocks_old: List[List[int]], blocks_new: List[List[int]]) -> set:
-        """
-        Identify which items moved between blocks.
-        
-        Returns set of item IDs where block assignment changed.
-        """
-        # Build item -> block indices
-        old_idx = blocks_to_block_index(blocks_old, 
-                                       sum(len(b) for b in blocks_old), 
-                                       validate=False)
-        new_idx = blocks_to_block_index(blocks_new,
-                                       sum(len(b) for b in blocks_new),
-                                       validate=False)
-        
-        changed = set()
-        for item in range(len(old_idx)):
-            if old_idx[item] != new_idx[item]:
-                changed.add(item)
-        return changed
-    
-    def _compute_distance_incremental(
-        self,
-        rankings_c: List[List[int]],
-        blocks_old: List[List[int]],
-        blocks_new: List[List[int]]
-    ) -> int:
-        """
-        Compute distance using incremental calculation if beneficial.
-        
-        Falls back to full computation if:
-        - Many items changed (incremental overhead not worth it)
-        - Block count changed significantly (cache invalidation)
-        - Incremental distance is disabled via config (use_incremental_distance=False)
-        
-        Returns total distance for the cluster.
-        """
-        # If incremental distance is disabled, always use full computation
-        if not self.cfg.use_incremental_distance:
-            from .blocks import T_of_blocks
-            Tm_new = T_of_blocks(blocks_new)
-            return self.dist_calculator.compute_distance(blocks_new, Tm_new, tiePenaltyWeight=self.cfg.tiePenaltyWeight)
-        
-        changed_items = self._compute_changed_items(blocks_old, blocks_new)
-        
-        # Threshold: if more than 30% of items changed, do full recompute
-        pct_changed = len(changed_items) / self.n if self.n > 0 else 0
-        if pct_changed > 0.3:
-            # Full recomputation
-            from .blocks import T_of_blocks
-            Tm_new = T_of_blocks(blocks_new)
-            return self.dist_calculator.compute_distance(blocks_new, Tm_new, tiePenaltyWeight=self.cfg.tiePenaltyWeight)
-        
-        # Use incremental calculation
-        from .blocks import T_of_blocks
-        Tm_new = T_of_blocks(blocks_new)
-        
-        return self.dist_calculator.compute_distance_incremental(
-            blocks_old,
-            blocks_new,
-            changed_items,
-            Tm_new,
-            tiePenaltyWeight=self.cfg.tiePenaltyWeight
-        )
-    
-    def _log_blocks_posterior_incremental(
-        self,
-        rankings_c: List[List[int]],
-        blocks_old: List[List[int]],
-        blocks_new: List[List[int]],
-        theta: float,
-        gamma: float,
-        delta: float,
-    ) -> float:
-        """
-        Compute log posterior using incremental distance calculation.
-        
-        This is an optimized version of log_blocks_posterior that uses
-        incremental distance updates when blocks change slightly.
-        
-        Parameters
-        ----------
-        rankings_c : list of lists
-            Rankings for this cluster
-        blocks_old : list of lists
-            Previous block structure
-        blocks_new : list of lists
-            New proposed block structure
-        theta, gamma, delta : float
-            Cluster parameters
-        
-        Returns
-        -------
-        log_posterior : float
-            Log probability of the move
-        """
-        if not rankings_c:
-            return float("-inf")
-        
-        from .blocks import T_of_blocks
-        profiler = get_profiler()
-        
-        # Use incremental distance calculation
-        if profiler:
-            t_start = time.time()
-        S_new = self._compute_distance_incremental(rankings_c, blocks_old, blocks_new)
-        if profiler:
-            profiler.record_operation("distance_calculation_incremental", time.time() - t_start)
-        
-        # Z* calculation (standard)
-        sizes_new = [len(b) for b in blocks_new]
-        K_new = len(sizes_new)
-        
-        if profiler:
-            t_start = time.time()
-        logZ = log_Z_star_from_sizes(sizes_new, theta, None, self.cfg.tiePenaltyWeight)
-        if profiler:
-            profiler.record_operation("z_star_calculation", time.time() - t_start)
-        
-        # Pitman-Yor prior calculation
-        if profiler:
-            t_start = time.time()
-        logpy = log_py_eppf_from_sizes(sizes_new, gamma, delta)
-        if profiler:
-            profiler.record_operation("py_prior_calculation", time.time() - t_start)
-        
-        return (-theta * S_new) - (len(rankings_c) * logZ) + logpy - math.lgamma(K_new + 1)
-
     # -----------------------
     # core updates
     # -----------------------
     
-    def _compute_all_disagreements(self) -> List[List[int]]:
+    def _compute_all_disagreements(self) -> np.ndarray:
+        """Compute disagreements[i][c] for all assessors × clusters via matmul.
+
+        Uses precomputed U_all and cached M/offsets.  Only rebuilds M rows
+        for clusters whose blocks changed (flagged dirty by
+        ``_rebuild_cluster_cache``).
+
+        The result is also stored in ``self._D_cache`` for reuse by
+        ``_update_cluster_theta``.
+
+        Returns ndarray of shape (N, C).
         """
-        OPTIMIZATION: Pre-compute all disagreement values in one pass.
-        
-        Returns:
-            disagreements[i][c] = cross_block_disagreements_fast(ranking_i, cluster_c)
-            
-        Benefits:
-        - Avoids recalculating disagreements inside the inner loop
-        - Optionally parallelizes over assessors if N is large enough
-        - Allows vectorization of logweight calculations
-        
-        Parallelization is disabled by default because the thread pool spawning overhead
-        (~1-2ms per call) dominates for typical problem sizes (N <= 300). For very large
-        N (500+), parallelization can provide a 20-30% speedup.
-        
-        This is computed fresh each iteration since thetas (and thus likelihoods) change.
-        """
-        cache = self._cache
-        C = self.C
-        N = self.N
-        rankings = self.rankings
-        
-        # Parallelization threshold check
-        use_parallel = _USE_JOBLIB and N >= self.parallel_threshold_n
-        
-        if use_parallel:
-            # Parallelize over assessors (each assessor's disagreements are independent)
-            disagreements_list = Parallel(n_jobs=-1, backend='threading')(
-                delayed(self._compute_disagreements_for_assessor)(i)
-                for i in range(N)
-            )
-            return disagreements_list
-        else:
-            # Sequential: compute all disagreements for each assessor (fast for N <= 300)
-            disagreements = []
-            for i, r_i in enumerate(rankings):
-                disc_for_i = []
-                for c in range(C):
-                    cc = cache[c]
-                    disc = cross_block_disagreements_fast(r_i, cc.block_idx, cc.K)
-                    disc_for_i.append(disc)
-                disagreements.append(disc_for_i)
-            return disagreements
-    
-    def _compute_disagreements_for_assessor(self, i: int) -> List[int]:
-        """Helper for parallelized disagreement calculation."""
-        cache = self._cache
-        C = self.C
-        r_i = self.rankings[i]
-        
-        disc_for_i = []
-        for c in range(C):
-            cc = cache[c]
-            disc = cross_block_disagreements_fast(r_i, cc.block_idx, cc.K)
-            disc_for_i.append(disc)
-        return disc_for_i
+        a_idx, b_idx = self._triu_indices
+
+        for c in range(self.C):
+            if self._M_dirty[c]:
+                bidx_arr = np.asarray(self._cache[c].block_idx, dtype=np.intp)
+                diff = bidx_arr[a_idx] - bidx_arr[b_idx]
+                self._M[c] = np.sign(-diff)
+                self._offsets[c] = np.count_nonzero(diff > 0)
+                self._M_dirty[c] = False
+
+        D = compute_all_disagreements_fast(self._U_all, self._M, self._offsets)
+        self._D_cache = D
+        return D
 
     def _update_z(self) -> None:
+        """Update cluster assignments using matmul-based disagreements.
+
+        All N×C disagreements are computed in a single BLAS matmul call
+        via ``_compute_all_disagreements`` (which uses precomputed U_all).
+        Log-weights are built with vectorised numpy, and sampling uses the
+        Gumbel-max trick for a single vectorised draw.
         """
-        OPTIMIZED: Uses cached calculations and vectorization to speed up cluster reassignment.
-        
-        Key optimizations:
-        1. Pre-compute all disagreements in one batch (avoid redundant calculations)
-        2. Parallelize over assessors if N >= 50 (embarrassingly parallel)
-        3. Vectorize logweight calculations where possible
-        4. Cache logZ values (computed once per theta period)
-        """
-        # Cache self references to eliminate attribute lookup overhead
         state = self.state
-        rng = self.rng
         C = self.C
         cache = self._cache
-        tie_penalty = self.cfg.tiePenaltyWeight
-        
-        # Pre-compute logZ once (same for all assessors in this iteration)
-        log_tau = [math.log(t) for t in state.tau]
-        logZ = [log_Z_star_from_sizes(cache[c].sizes, state.clusters[c].theta, None, tie_penalty) 
-                for c in range(C)]
-        
-        # OPTIMIZATION 1: Batch compute all disagreements upfront (avoid N×C redundant calculations)
-        disagreements = self._compute_all_disagreements()
-        
-        # Get theta values once (small optimization, but avoids repeated lookups)
-        thetas = [state.clusters[c].theta for c in range(C)]
-        
-        # Get Tm values (cached, no recalculation)
-        Tms = [cache[c].Tm for c in range(C)]
-        
-        # OPTIMIZATION 2 & 3: Vectorized sample computation
-        if _USE_NUMPY:
-            # Vectorized version using NumPy broadcasting
-            disagreements_array = np.array(disagreements, dtype=np.float64)  # N×C matrix
-            logweights_array = np.zeros_like(disagreements_array)
-            
-            for c in range(C):
-                logweights_array[:, c] = (
-                    log_tau[c] 
-                    - thetas[c] * (2 * disagreements_array[:, c] + tie_penalty * Tms[c])
-                    - logZ[c]
-                )
-            
-            # Sample assignments using vectorized computation
-            for i in range(self.N):
-                logw = logweights_array[i].tolist()
-                state.z[i] = sample_categorical_from_logweights(logw, rng)
-        else:
-            # Pure Python fallback (when numpy unavailable)
-            for i in range(self.N):
-                logw = []
-                for c in range(C):
-                    disc = disagreements[i][c]
-                    d_ic = 2 * disc + tie_penalty * Tms[c]
-                    logw.append(log_tau[c] - thetas[c] * d_ic - logZ[c])
-                state.z[i] = sample_categorical_from_logweights(logw, rng)
+        tie_penalty = self.cfg.tie_penalty
+
+        # Per-cluster scalars (computed once per iteration)
+        log_tau = np.array([math.log(t) for t in state.tau])
+        thetas = np.array([state.clusters[c].theta for c in range(C)])
+
+        # Cache q-factorials: rebuild only when theta changes
+        if not hasattr(self, '_qfact_cache'):
+            self._qfact_cache = {}
+        logZ = np.empty(C)
+        for c in range(C):
+            theta_c = state.clusters[c].theta
+            q_c = math.exp(-theta_c)
+            # Cache key: (n, q) rounded to avoid float comparison issues
+            qkey = round(q_c, 15)
+            if qkey not in self._qfact_cache:
+                self._qfact_cache[qkey] = build_log_qfactorials(self.n, q_c)
+            logZ[c] = log_Z_star_from_sizes(
+                cache[c].sizes, theta_c, self._qfact_cache[qkey], tie_penalty)
+
+        Tms = np.array([cache[c].Tm for c in range(C)], dtype=np.float64)
+
+        # N×C disagreement matrix (single matmul)
+        D = self._compute_all_disagreements()  # ndarray (N, C)
+
+        # Vectorised log-weights: shape (N, C)
+        logweights = (log_tau[np.newaxis, :]
+                      - thetas[np.newaxis, :] * (D + tie_penalty * Tms[np.newaxis, :])
+                      - logZ[np.newaxis, :])
+
+        # Gumbel-max trick: sample all N assignments in one vectorised op
+        gumbels = -np.log(-np.log(
+            np.random.default_rng(self.rng.randint(0, 2**31)).random((self.N, C))
+        ))
+        z_new = np.argmax(logweights + gumbels, axis=1)
+        state.z = z_new.tolist()
 
     def _update_tau(self) -> None:
         # Cache self references to eliminate attribute lookup overhead
@@ -531,6 +398,7 @@ class MixtureRankingModel:
         state = self.state
         rng = self.rng
         cache = self._cache
+        tie_penalty = self.cfg.tie_penalty
         
         n_c = len(rankings_c)
         if n_c == 0:
@@ -542,11 +410,27 @@ class MixtureRankingModel:
         theta_old = cl.theta
         theta_new = math.exp(math.log(theta_old) + rng.gauss(0.0, step))
 
-        # S_c using cached block_idx/K/Tm; delegate to vectorized helper
-        S_c = total_distance_fast(rankings_c, cl.blocks, self.cfg.tiePenaltyWeight)
+        # S_c from cached D matrix (computed during _update_z): column sum
+        # D[i,c] = cross-block disagreements; add tie penalty for full distance
+        if hasattr(self, '_D_cache') and self._D_cache is not None:
+            cluster_mask = np.array([zi == c for zi in state.z], dtype=bool)
+            S_c = float(self._D_cache[cluster_mask, c].sum()) + tie_penalty * cc.Tm * n_c
+        else:
+            S_c = total_distance_fast(rankings_c, cl.blocks, tie_penalty)
 
-        lp_old = (-theta_old * S_c) - n_c * log_Z_star_from_sizes(cc.sizes, theta_old, None, self.cfg.tiePenaltyWeight) + self._log_gamma_pdf(theta_old, a_theta, b_theta)
-        lp_new = (-theta_new * S_c) - n_c * log_Z_star_from_sizes(cc.sizes, theta_new, None, self.cfg.tiePenaltyWeight) + self._log_gamma_pdf(theta_new, a_theta, b_theta)
+        # Reuse cached q-factorials where possible
+        qfact_cache = getattr(self, '_qfact_cache', {})
+        def _logZ(theta):
+            q = math.exp(-theta)
+            qkey = round(q, 15)
+            lqf = qfact_cache.get(qkey)
+            if lqf is None:
+                lqf = build_log_qfactorials(self.n, q)
+                qfact_cache[qkey] = lqf
+            return log_Z_star_from_sizes(cc.sizes, theta, lqf, tie_penalty)
+
+        lp_old = (-theta_old * S_c) - n_c * _logZ(theta_old) + self._log_gamma_pdf(theta_old, a_theta, b_theta)
+        lp_new = (-theta_new * S_c) - n_c * _logZ(theta_new) + self._log_gamma_pdf(theta_new, a_theta, b_theta)
 
         log_hast = math.log(theta_new) - math.log(theta_old)
         log_acc = (lp_new - lp_old) + log_hast
@@ -554,7 +438,6 @@ class MixtureRankingModel:
         accepted = math.log(rng.random()) < min(0.0, log_acc)
         if accepted:
             cl.theta = theta_new
-        # (theta changes do not invalidate cache, since cache is only blocks-derived)
         return 1, (1 if accepted else 0)
 
     def _update_cluster_blocks(
@@ -563,159 +446,57 @@ class MixtureRankingModel:
         rankings_c: List[List[int]],
         *,
         n_item_moves: int = 2,
-        p_gibbs_reassign: float = 0.0,
-        p_transfer: float = 0.25,
-        p_swapshift: float = 0.25,
-        p_splitmerge: float = 0.25,
-        p_reassign: float = 0.25,
         gamma: Optional[float] = None,
         delta: Optional[float] = None,
-        profiler=None,  # OPTIMIZATION: Accept profiler instead of calling get_profiler() in loop
+        profiler=None,
     ) -> Tuple[int, int, bool]:
         if not rankings_c:
             return 0, 0, False
-        
-        # Cache self references to eliminate repeated attribute lookups in tight loop
+
         rng = self.rng
         cfg = self.cfg
         state = self.state
         cl = state.clusters[c]
-        
-        # Cache frequently-accessed cluster parameters
         cl_blocks = cl.blocks
         cl_theta = cl.theta
 
-        # allow sampler-wide overrides for the PY hyperparameters
         if gamma is None:
             gamma = cl.gamma
         if delta is None:
             delta = cl.delta
 
-        # Cache cfg parameters accessed in loop
-        cfg_ordering_p_short = cfg.ordering_p_short
-        cfg_ordering_n_swap_steps = cfg.ordering_n_swap_steps
-        cfg_ordering_max_long_step = cfg.ordering_max_long_step
-        cfg_splitmerge_p_merge = cfg.splitmerge_p_merge
-
-        # OPTIMIZATION: Initialize posterior cache to avoid recalculation when theta unchanged
-        # Maps (blocks_tuple, theta, gamma, delta) → posterior_value
-        # Cache naturally stays small (~10-20 entries) due to acceptance dynamics.
-        posterior_cache: dict = {}
-        cache_max_size = 50  # Limit to prevent memory growth; reset if exceeded
-
-# Normalize ALL move probabilities (including p_reassign for the else clause)
-        # The 4 block moves + 1 reassign move form a complete set of options
-        s = p_gibbs_reassign + p_transfer + p_swapshift + p_splitmerge + p_reassign
-        if s <= 0:
-            # Fallback if all probabilities are 0
-            s = 1.0
-        p_gibbs_reassign, p_transfer, p_swapshift, p_splitmerge, p_reassign = (
-            p_gibbs_reassign / s,
-            p_transfer / s,
-            p_swapshift / s,
-            p_splitmerge / s,
-            p_reassign / s,
-        )
-
-        # record before state to detect whether any MH move was accepted
         before_key = _canonicalize_blocks(cl_blocks)
 
         proposals = 0
         accepts = 0
 
+        cluster_mask = np.array([zi == c for zi in state.z], dtype=bool)
+        _fast_H = self._U_all[cluster_mask].sum(axis=0)
+
         for _ in range(n_item_moves):
-            u = rng.random()
-            move_name = None
             t_move_start = time.time()
-            
-            if u < p_gibbs_reassign:
-                move_name = "gibbs_reassign"
-                out_blocks, p, a = gibbs_reassign_one_item(
-                    rankings=rankings_c,
-                    blocks=cl_blocks,
-                    theta=cl_theta,
-                    gamma=gamma,
-                    delta=delta,
-                    rng=rng
-                )
-            elif u < p_gibbs_reassign + p_transfer:
-                move_name = "mh_transfer"
-                out_blocks, p, a = mh_adjacent_item_transfer(
-                    rankings_c=rankings_c,
-                    blocks=cl_blocks,
-                    theta=cl_theta,
-                    gamma=gamma,
-                    delta=delta,
-                    rng=rng,
-                    blocks_old=cl_blocks,
-                    distance_calculator=self.dist_calculator,
-                    use_parallel=(self.N > 100),
-                    posterior_cache=posterior_cache
-                )
-            elif u < p_gibbs_reassign + p_transfer + p_swapshift:
-                move_name = "mh_swapshift"
-                out_blocks, p, a = mh_ordering_swap_or_shift(
-                    rankings_c=rankings_c,
-                    blocks=cl_blocks,
-                    theta=cl_theta,
-                    gamma=gamma,
-                    delta=delta,
-                    rng=rng,
-                    p_short=cfg_ordering_p_short,
-                    n_swap_steps=cfg_ordering_n_swap_steps,
-                    max_long_step=cfg_ordering_max_long_step,
-                    blocks_old=cl_blocks,
-                    distance_calculator=self.dist_calculator,
-                    use_parallel=(self.N > 100),
-                    posterior_cache=posterior_cache
-                )
-            elif u < p_gibbs_reassign + p_transfer + p_swapshift + p_splitmerge:
-                move_name = "mh_splitmerge"
-                out_blocks, p, a = mh_adjacent_split_merge(
-                    rankings_c=rankings_c,
-                    blocks=cl_blocks,
-                    theta=cl_theta,
-                    gamma=gamma,
-                    delta=delta,
-                    rng=rng,
-                    p_merge=cfg_splitmerge_p_merge,
-                )
-            else:
-                move_name = "mh_py_reassign"
-                out_blocks, p, a = mh_py_prior_reassign_one_item(
-                    rankings_c=rankings_c,
-                    blocks=cl_blocks,
-                    theta=cl_theta,
-                    gamma=gamma,
-                    delta=delta,
-                    rng=rng,
-                    blocks_old=cl_blocks,
-                    distance_calculator=self.dist_calculator,
-                    use_parallel=(self.N > 100),
-                    posterior_cache=posterior_cache
-                )
-            
+            out_blocks, p, a = fast_gibbs_reassign_one_item(
+                rankings=rankings_c,
+                blocks=cl_blocks,
+                theta=cl_theta,
+                gamma=gamma,
+                delta=delta,
+                H=_fast_H,
+                rng=rng,
+                tie_penalty=cfg.tie_penalty,
+            )
             t_move_elapsed = time.time() - t_move_start
-            
-            # OPTIMIZATION: Use passed-in profiler instead of calling get_profiler() in loop
-            if profiler is not None and move_name:
-                profiler.record_move(move_name, t_move_elapsed, accepted=False, proposals=p or 1, accepts=a or 0)
+
+            if profiler is not None:
+                profiler.record_move("gibbs_reassign", t_move_elapsed, accepted=False, proposals=p or 1, accepts=a or 0)
 
             proposals += (p if p is not None else 0)
             accepts += (a if a is not None else 0)
             cl_blocks = out_blocks
 
-        # Update the actual cluster blocks
         cl.blocks = cl_blocks
-        
-        # blocks changed -> refresh cache
         after_key = _canonicalize_blocks(cl_blocks)
         self._rebuild_cluster_cache(c)
-        
-        # OPTIMIZATION: Limit posterior cache size to prevent unbounded growth
-        # Cache is naturally small but reset if exceeds threshold (e.g., many parameter changes)
-        if len(posterior_cache) > cache_max_size:
-            posterior_cache.clear()
 
         return proposals, accepts, (before_key != after_key)
 
@@ -751,16 +532,8 @@ class MixtureRankingModel:
             model.step(iteration=it, theta_jump=10)  # Update theta every 10 iterations
         """
         cfg = self.cfg
-        # OPTIMIZATION: Cache profiler once to avoid repeated get_profiler() calls
         profiler = get_profiler()
-        
-        # If user specifies any block-move probability, auto-zero the unspecified ones
-        block_move_keys = {'p_gibbs_reassign', 'p_transfer', 'p_swapshift', 'p_splitmerge', 'p_reassign'}
-        specified_keys = block_move_keys & set(overrides.keys())
-        if specified_keys:
-            for key in block_move_keys - specified_keys:
-                overrides[key] = 0.0
-        
+
         # allow per-call overrides
         for k, v in overrides.items():
             if not hasattr(cfg, k):
@@ -800,14 +573,9 @@ class MixtureRankingModel:
             bp, ba, block_changed = self._update_cluster_blocks(
                 c, Rc,
                 n_item_moves=cfg.n_item_moves_per_cluster,
-                p_gibbs_reassign=cfg.p_gibbs_reassign,
-                p_transfer=cfg.p_transfer,
-                p_swapshift=cfg.p_swapshift,
-                p_splitmerge=cfg.p_splitmerge,
-                p_reassign=cfg.p_reassign,
                 gamma=cfg.gamma,
                 delta=cfg.delta,
-                profiler=profiler,  # OPTIMIZATION: Pass cached profiler to avoid get_profiler() in loop
+                profiler=profiler,
             )
             if profiler:
                 profiler.record_stage("update_blocks", time.time() - t_start)
@@ -860,8 +628,7 @@ class MixtureRankingModel:
         save_logp: bool = True,
         save_acceptance_details: bool = False,
         n_item_moves_per_cluster: int = 2,
-        tiePenaltyWeight: float = 1.0,
-        use_incremental_distance: bool = True,
+        tie_penalty: float = 0.5,
         use_annealing: bool = False,
         annealing_schedule: Optional[List[float]] = None,
         annealing_schedule_type: str = "linear",
@@ -878,16 +645,14 @@ class MixtureRankingModel:
             updates most of the time for faster sampling. E.g., theta_jump=10 updates
             theta every 10 iterations. This can provide 2-5x speedup at the cost of
             longer autocorrelation in theta chains.
-        tiePenaltyWeight : float, default=1.0
-            Multiplier for the within-block penalty term (T_m) in distance calculations.
-            Controls how much ties in the rankings are penalized. Must be > 0.
-            - Values < 1.0: De-emphasize ties
-            - Values = 1.0: Standard Mallows model (default)
-            - Values > 1.0: Emphasize ties
-        use_incremental_distance : bool, default=True
-            If True, use incremental distance calculation for block updates (faster).
-            If False, always use full Fenwick tree calculation. Set to False for debugging
-            or if you suspect distance calculation issues.
+        tie_penalty : float, default=0.5
+            Weight for the within-block penalty term (T_m) in distance calculations.
+            The p in the K^(p) extended Kendall distance, where p=0.5 recovers the
+            Kemeny distance. Controls how much ties in rankings are penalized. p should be a value between (0, 1]
+            Must be > 0.
+            - Values < 0.5: De-emphasize ties relative to inversions (Only a near metric)
+            - Values = 0.5: Kemeny/standard Mallows model (default)
+            - Values > 0.5: Emphasize ties relative to inversions 
         use_annealing : bool, default=False
             If True, apply temperature annealing during burn-in to prevent cluster collapse.
             Starts with a soft likelihood (low theta) to explore cluster configurations,
@@ -927,8 +692,8 @@ class MixtureRankingModel:
             raise ValueError("thin must be >= 1")
         if burn_in < 0:
             raise ValueError("burn_in must be >= 0")
-        if tiePenaltyWeight <= 0:
-            raise ValueError("tiePenaltyWeight must be > 0")
+        if tie_penalty <= 0:
+            raise ValueError("tie_penalty must be > 0")
 
         # Setup temperature annealing schedule
         temperature_schedule: Optional[List[float]] = None
@@ -960,22 +725,13 @@ class MixtureRankingModel:
 
         # apply any sampler-specific options upfront
         if sampler_kwargs:
-            block_move_keys = {'p_gibbs_reassign', 'p_transfer', 'p_swapshift', 'p_splitmerge', 'p_reassign'}
-            specified_keys = block_move_keys & set(sampler_kwargs.keys())
-            if specified_keys:
-                for key in block_move_keys - specified_keys:
-                    sampler_kwargs[key] = 0.0
-            
             if "n_item_moves_per_cluster" in sampler_kwargs:
                 n_item_moves_per_cluster = sampler_kwargs.pop("n_item_moves_per_cluster")
             self.set_sampler(**sampler_kwargs)
-        
+
         # Apply tie penalty weight
-        if tiePenaltyWeight != 1.0:
-            self.cfg.tiePenaltyWeight = tiePenaltyWeight
-        
-        # Apply incremental distance setting
-        self.cfg.use_incremental_distance = use_incremental_distance
+        if tie_penalty != 0.5:
+            self.cfg.tie_penalty = tie_penalty
 
         samples: Optional[MCMCSamples] = None
         if save_samples:
@@ -1008,7 +764,6 @@ class MixtureRankingModel:
 
         if self.verbose:
             print(f"\n[MCMC] Starting run: n_iter={n_iter}, burn_in={burn_in}, thin={thin}, theta_jump={theta_jump}")
-            print(f"[MCMC] Sampler config: p_gibbs_reassign={self.cfg.p_gibbs_reassign:.3f}, p_transfer={self.cfg.p_transfer:.3f}, p_swapshift={self.cfg.p_swapshift:.3f}, p_splitmerge={self.cfg.p_splitmerge:.3f}, p_reassign={self.cfg.p_reassign:.3f}")
             print(f"[MCMC] Item moves per cluster: {n_item_moves_per_cluster}")
             saved_iters = (n_iter - burn_in + thin - 1) // thin if save_samples else 0
             print(f"[MCMC] Will save {saved_iters} iterations after burn-in\n")
@@ -1155,7 +910,178 @@ class MixtureRankingModel:
             out["theta_summary"] = None
 
         return out
-    
+
+    def find_map(
+        self,
+        samples: Optional[MCMCSamples] = None,
+        *,
+        refine: bool = True,
+        max_sweeps: int = 50,
+        verbose: bool = True,
+    ) -> Dict[str, Any]:
+        """Find the MAP state from the MCMC chain and optionally refine with ICM.
+
+        1. Recover the state with the highest ``log_joint`` from saved samples.
+        2. (Optional) Run Iterated Conditional Modes (ICM) sweeps on the block
+           structures — deterministic hill-climbing that reuses the fast
+           H-vector + prefix-sum machinery from the Gibbs sampler.
+
+        Parameters
+        ----------
+        samples : MCMCSamples, optional
+            If None, uses ``self.samples``.
+        refine : bool
+            If True (default), run ICM sweeps after recovering the best sample.
+        max_sweeps : int
+            Maximum number of ICM sweeps per cluster (stops early on convergence).
+        verbose : bool
+            Print progress information.
+
+        Returns
+        -------
+        dict with keys:
+            ``best_t``          – index of the best sample in the chain
+            ``logp_chain``      – log-joint of the best sample (before refinement)
+            ``logp_refined``    – log-joint after ICM refinement (if refine=True)
+            ``z``               – cluster assignments
+            ``tau``             – mixture weights
+            ``clusters``        – list of dicts per cluster with ``blocks``, ``theta``,
+                                  ``icm_moves``, ``icm_sweeps``
+        """
+        if samples is None:
+            if self.samples is None:
+                raise RuntimeError("No samples. Run run_mcmc(save_samples=True) first.")
+            samples = self.samples
+
+        if samples.logp is None or not samples.logp:
+            raise ValueError("No logp saved. Run with save_samples=True and ensure logp is recorded.")
+
+        # ── Step 1: find the best sample in the chain ──
+        logp_arr = np.asarray(samples.logp)
+        best_t = int(np.argmax(logp_arr))
+        logp_chain = float(logp_arr[best_t])
+
+        if verbose:
+            print(f"[MAP] Best sample at t={best_t} with logp={logp_chain:.4f}")
+
+        # Recover state
+        z_best = samples.z_samples[best_t][:]
+        blocks_best = [[b[:] for b in samples.blocks_samples[best_t][c]] for c in range(self.C)]
+
+        tau_best = None
+        if samples.tau_samples is not None:
+            tau_best = samples.tau_samples[best_t][:]
+
+        theta_best = []
+        for c in range(self.C):
+            if samples.theta_samples is not None:
+                theta_best.append(samples.theta_samples[best_t][c])
+            else:
+                theta_best.append(self.state.clusters[c].theta)
+
+        # Temporarily install this state into the model for log_joint evaluation
+        old_state = self.state
+        self.state = MixtureState(
+            clusters=[
+                ClusterParams(
+                    blocks=blocks_best[c],
+                    theta=theta_best[c],
+                    gamma=old_state.clusters[c].gamma,
+                    delta=old_state.clusters[c].delta,
+                )
+                for c in range(self.C)
+            ],
+            z=z_best,
+            tau=tau_best if tau_best else old_state.tau[:],
+        )
+        # Rebuild caches for current state
+        for c in range(self.C):
+            self._rebuild_cluster_cache(c)
+        self._M_dirty = [True] * self.C
+        self._compute_all_disagreements()
+
+        # ── Step 2: ICM refinement ──
+        result_clusters = []
+        if refine:
+            z_arr = np.asarray(self.state.z, dtype=np.intp)
+
+            for c in range(self.C):
+                mask = z_arr == c
+                N_c = int(mask.sum())
+                if N_c == 0:
+                    result_clusters.append({
+                        "blocks": blocks_best[c],
+                        "theta": theta_best[c],
+                        "icm_moves": 0,
+                        "icm_sweeps": 0,
+                    })
+                    continue
+
+                H_c = self._U_all[mask].sum(axis=0)
+                cl = self.state.clusters[c]
+
+                new_blocks, total_moves, sweeps = icm_sweep_cluster(
+                    blocks=cl.blocks,
+                    theta=cl.theta,
+                    gamma=cl.gamma,
+                    delta=cl.delta,
+                    H=H_c,
+                    N=N_c,
+                    n=self.n,
+                    tie_penalty=self.cfg.tie_penalty,
+                    max_sweeps=max_sweeps,
+                )
+
+                cl.blocks = new_blocks
+                self._rebuild_cluster_cache(c)
+                self._M_dirty[c] = True
+
+                if verbose:
+                    print(f"  Cluster {c}: {total_moves} moves in {sweeps} sweeps, "
+                          f"K={len(new_blocks)} blocks")
+
+                result_clusters.append({
+                    "blocks": new_blocks,
+                    "theta": theta_best[c],
+                    "icm_moves": total_moves,
+                    "icm_sweeps": sweeps,
+                })
+
+            # Recompute logp after refinement
+            self._compute_all_disagreements()
+            logp_refined = self.log_joint()
+        else:
+            logp_refined = logp_chain
+            for c in range(self.C):
+                result_clusters.append({
+                    "blocks": blocks_best[c],
+                    "theta": theta_best[c],
+                    "icm_moves": 0,
+                    "icm_sweeps": 0,
+                })
+
+        if verbose:
+            delta_lp = logp_refined - logp_chain
+            print(f"[MAP] logp: {logp_chain:.4f} → {logp_refined:.4f} "
+                  f"(Δ={delta_lp:+.4f})")
+
+        out = {
+            "best_t": best_t,
+            "logp_chain": logp_chain,
+            "logp_refined": logp_refined,
+            "z": self.state.z[:],
+            "tau": self.state.tau[:],
+            "clusters": result_clusters,
+        }
+
+        # Restore original state
+        self.state = old_state
+        for c in range(self.C):
+            self._rebuild_cluster_cache(c)
+        self._M_dirty = [True] * self.C
+
+        return out
+
     def acceptance_statistics(self, parameter: Optional[str] = None) -> Dict[str, Any]:
         """Compute acceptance statistics after a run."""
         from AcceptanceProbabilities import acceptance_probabilities
@@ -1175,33 +1101,64 @@ class MixtureRankingModel:
         print_acceptance_summary(self.samples, self.C)
     
     def log_joint(self) -> float:
-        """Unnormalized log posterior (up to constants) of current state."""
-        # Cache self references to eliminate repeated attribute lookups
+        """Unnormalized log posterior (up to constants) of current state.
+
+        Uses the cached D matrix (from ``_compute_all_disagreements``) when
+        available, avoiding an expensive O(N n²) recomputation per call.
+        """
         state = self.state
         init_mu = self.init_mu
         C = self.C
-        rankings = self.rankings
-        state_z = state.z
-        
+        tie_penalty = self.cfg.tie_penalty
+
         lp = 0.0
 
-        # tau prior: Dirichlet(mu) has log p(tau) = const + sum((mu_c-1)log tau_c)
+        # tau prior: Dirichlet(mu)
         state_tau = state.tau
         for c, t in enumerate(state_tau):
             if t <= 0:
                 return float("-inf")
             lp += (init_mu[c] - 1.0) * math.log(t)
 
-        # z likelihood part
-        for zi in state_z:
+        # z likelihood
+        for zi in state.z:
             lp += math.log(state_tau[zi])
 
-        # cluster blocks + theta likelihood + priors
+        # cluster blocks + theta + priors — via cached D matrix
+        use_cache = hasattr(self, '_D_cache') and self._D_cache is not None
+        if use_cache:
+            z_arr = np.asarray(state.z, dtype=np.intp)
+            qfact_cache = getattr(self, '_qfact_cache', {})
+
         for c, cl in enumerate(state.clusters):
-            Rc = [r for r, zi in zip(rankings, state_z) if zi == c]
-            if Rc:
-                lp += log_blocks_posterior(Rc, cl.blocks, cl.theta, cl.gamma, cl.delta, tiePenaltyWeight=self.cfg.tiePenaltyWeight)
-                lp += self._log_gamma_pdf(cl.theta, 2.0, 1.0)
+            if use_cache:
+                mask = z_arr == c
+                n_c = int(mask.sum())
+                if n_c == 0:
+                    continue
+                # S_c = sum of (cross-block disagreements + tie_penalty * Tm)
+                S_c = float(self._D_cache[mask, c].sum()) + tie_penalty * self._cache[c].Tm * n_c
+
+                # logZ via cached q-factorials
+                q_c = math.exp(-cl.theta)
+                qkey = round(q_c, 15)
+                if qkey not in qfact_cache:
+                    qfact_cache[qkey] = build_log_qfactorials(self.n, q_c)
+                logZ_c = log_Z_star_from_sizes(
+                    self._cache[c].sizes, cl.theta, qfact_cache[qkey], tie_penalty)
+
+                # Pitman-Yor prior
+                logpy = log_py_eppf_from_sizes(self._cache[c].sizes, cl.gamma, cl.delta)
+                K = len(cl.blocks)
+
+                lp += (-cl.theta * S_c) - (n_c * logZ_c) + logpy - math.lgamma(K + 1)
+            else:
+                Rc = [r for r, zi in zip(self.rankings, state.z) if zi == c]
+                if not Rc:
+                    continue
+                lp += log_blocks_posterior(Rc, cl.blocks, cl.theta, cl.gamma, cl.delta, tie_penalty=tie_penalty)
+
+            lp += self._log_gamma_pdf(cl.theta, self.cfg.a_theta, self.cfg.b_theta)
 
         return lp
     

@@ -30,32 +30,32 @@ def build_log_qfactorials(n: int, q: float) -> List[float]:
 
 
 # internal cached computation when log_qfact is not provided
-# Note: tiePenaltyWeight is not cached to avoid cache invalidation issues
+# Note: tie_penalty is not cached to avoid cache invalidation issues
 # Use log_Z_star_from_sizes instead, which handles this properly
-def _log_Z_star_core(sizes_tuple: Tuple[int, ...], theta: float, tiePenaltyWeight: float = 1.0) -> float:
+def _log_Z_star_core(sizes_tuple: Tuple[int, ...], theta: float, tie_penalty: float = 0.5) -> float:
     # builds qfactorials internally; sizes_tuple is tuple of ints
     sizes = list(sizes_tuple)
     if theta <= 0:
         return float("-inf")
     n = sum(sizes)
-    q = math.exp(-2.0 * theta)
+    q = math.exp(-1.0 * theta)
 
     Tm = sum(s * (s - 1) // 2 for s in sizes)
     logP = sum(math.lgamma(s + 1) for s in sizes)
 
     log_qfact = build_log_qfactorials(n, q)
-    return (-theta * tiePenaltyWeight * Tm) + logP + (log_qfact[n] - sum(log_qfact[s] for s in sizes))
+    return (-theta * tie_penalty * Tm) + logP + (log_qfact[n] - sum(log_qfact[s] for s in sizes))
 
 
-def log_Z_star_from_sizes(sizes: List[int], theta: float, log_qfact: Optional[List[float]] = None, tiePenaltyWeight: float = 1.0) -> float:
+def log_Z_star_from_sizes(sizes: List[int], theta: float, log_qfact: Optional[List[float]] = None, tie_penalty: float = 0.5) -> float:
     # if caller didn't supply precomputed log_qfactorials, use core with weight
     if log_qfact is None:
-        return _log_Z_star_core(tuple(sizes), theta, tiePenaltyWeight)
+        return _log_Z_star_core(tuple(sizes), theta, tie_penalty)
 
     if theta <= 0:
         return float("-inf")
     n = sum(sizes)
-    q = math.exp(-2.0 * theta)
+    q = math.exp(-1.0 * theta)
 
     Tm = sum(s * (s - 1) // 2 for s in sizes)
     logP = sum(math.lgamma(s + 1) for s in sizes)
@@ -63,11 +63,11 @@ def log_Z_star_from_sizes(sizes: List[int], theta: float, log_qfact: Optional[Li
     if len(log_qfact) < n + 1:
         log_qfact = build_log_qfactorials(n, q)
 
-    return (-theta * tiePenaltyWeight * Tm) + logP + (log_qfact[n] - sum(log_qfact[s] for s in sizes))
+    return (-theta * tie_penalty * Tm) + logP + (log_qfact[n] - sum(log_qfact[s] for s in sizes))
 
 
-def log_Z_star(blocks: List[List[int]], theta: float, tiePenaltyWeight: float = 1.0) -> float:
-    return log_Z_star_from_sizes([len(b) for b in blocks], theta, None, tiePenaltyWeight)
+def log_Z_star(blocks: List[List[int]], theta: float, tie_penalty: float = 0.5) -> float:
+    return log_Z_star_from_sizes([len(b) for b in blocks], theta, None, tie_penalty)
 
 
 def log_py_eppf_from_sizes(sizes: List[int], gamma: float, delta: float) -> float:
@@ -108,29 +108,13 @@ def log_blocks_posterior(
     blocks_old: Optional[List[List[int]]] = None,
     distance_calculator=None,
     parallel: bool = False,
-    tiePenaltyWeight: float = 1.0,
+    tie_penalty: float = 0.5,
 ) -> float:
-    """
-    Compute log posterior of blocks given cluster rankings.
-    
-    Parameters
-    ----------
-    rankings_c : list of lists
-        Cluster-specific rankings
-    blocks : list of lists
-        Block structure
-    theta, gamma, delta : float
-        Model parameters
-    blocks_old : list of lists, optional
-        Previous blocks (enables incremental distance calculation)
-    distance_calculator : object, optional
-        IncrementalDistanceCalculator for fast incremental updates
-    parallel : bool
-        Use parallel computation for distance calculation
-    
-    Returns
-    -------
-    log_posterior : float
+    """Compute log posterior of blocks given cluster rankings.
+
+    The ``blocks_old``, ``distance_calculator``, and ``parallel`` parameters
+    are accepted for backward compatibility with legacy code but are ignored;
+    the full distance is always computed via ``total_distance_fast``.
     """
     if not rankings_c:
         return float("-inf")
@@ -138,37 +122,26 @@ def log_blocks_posterior(
     K = len(sizes)
     from .distance import total_distance_fast
     from .profiling import get_profiler
-    
+
     profiler = get_profiler()
 
-    # Distance calculation - use incremental if available
     if profiler:
         t_start = time.time()
-    
-    if distance_calculator is not None and blocks_old is not None:
-        # Use incremental calculation with smart heuristic
-        S = distance_calculator.compute_distance_with_heuristic(blocks_old, blocks, parallel=parallel, tiePenaltyWeight=tiePenaltyWeight)
-        if profiler:
-            profiler.record_operation("distance_calculation_incremental", time.time() - t_start)
-    else:
-        # Standard full calculation
-        S = total_distance_fast(rankings_c, blocks, tiePenaltyWeight=tiePenaltyWeight)
-        if profiler:
-            profiler.record_operation("distance_calculation", time.time() - t_start)
-    
-    # Z* calculation
+    S = total_distance_fast(rankings_c, blocks, tie_penalty=tie_penalty)
+    if profiler:
+        profiler.record_operation("distance_calculation", time.time() - t_start)
+
     if profiler:
         t_start = time.time()
-    logZ = log_Z_star_from_sizes(sizes, theta, None, tiePenaltyWeight)
+    logZ = log_Z_star_from_sizes(sizes, theta, None, tie_penalty)
     if profiler:
         profiler.record_operation("z_star_calculation", time.time() - t_start)
-    
-    # Pitman-Yor prior calculation
+
     if profiler:
         t_start = time.time()
     logpy = log_py_eppf_from_sizes(sizes, gamma, delta)
     if profiler:
         profiler.record_operation("py_prior_calculation", time.time() - t_start)
-    
+
     return (-theta * S) - (len(rankings_c) * logZ) + logpy - math.lgamma(K + 1)
 

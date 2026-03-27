@@ -1,14 +1,27 @@
-"""Block-move and MH/Gibbs helper functions."""
+"""Block helpers and fast Gibbs item-reassignment move.
 
-import math, random, time
-from typing import List, Tuple, Optional, Callable
+Fast Gibbs complexity (per call to ``fast_gibbs_reassign_one_item``)
+--------------------------------------------------------------------
+* U_all precomputation (amortised, done once): O(N n²)
+* H from U_all (once per cluster): O(N_c · n_pairs) via vectorised sum
+* Per call: O(n) H_gt groups + O(K) prefix-sum; then O(1) per candidate.
+
+vs old ``gibbs_reassign_one_item`` (in legacy/old_moves.py): O(2K · N n log K).
+"""
+
+import math
+import random
+from math import comb, lgamma, log
+from typing import List, Optional, Tuple
+
+import numpy as np
 
 from .blocks import blocks_to_block_index
-from .distance import total_distance_fast, cross_block_disagreements_fast
-from .priors import log_Z_star_from_sizes, log_py_eppf_from_sizes, log_blocks_posterior
+from .priors import build_log_qfactorials
 from .utils import sample_categorical_from_logweights
-from .profiling import get_profiler
 
+
+# ── basic block helpers ───────────────────────────────────────
 
 def remove_item_from_blocks(blocks: List[List[int]], x: int) -> Tuple[List[List[int]], int]:
     new_blocks = [b[:] for b in blocks]
@@ -39,572 +52,398 @@ def apply_move_new_block(blocks_minus: List[List[int]], x: int, pos: int) -> Lis
     return nb
 
 
-def gibbs_reassign_one_item(
+# ── pairwise-preference precomputation ───────────────────────
+
+def _pair_index(a: int, b: int, n: int) -> int:
+    """Flat index into upper-triangular pair vector for (a, b) with a < b."""
+    return a * (2 * n - a - 1) // 2 + (b - a - 1)
+
+
+def compute_U_all(
+    rankings: List[List[int]], n: int
+) -> np.ndarray:
+    """Build per-assessor pairwise preference matrix.  Computed **once**.
+
+    Rankings are in position→item format (strict_r[pos] = item).
+    We invert each ranking to get item→position, then compare positions.
+
+    Returns U_all of shape ``(N, comb(n, 2))`` where
+    ``U_all[i, pair_index(a, b)] = 1`` iff item *a* is ranked **after**
+    item *b* by assessor *i* (i.e. position_of(a) > position_of(b)).
+    """
+    N = len(rankings)
+    n_pairs = comb(n, 2)
+    U = np.zeros((N, n_pairs), dtype=np.float64)
+    for i in range(N):
+        r = rankings[i]
+        inv_r = [0] * n
+        for pos in range(n):
+            inv_r[r[pos]] = pos
+        idx = 0
+        for a in range(n):
+            for b in range(a + 1, n):
+                if inv_r[a] > inv_r[b]:
+                    U[i, idx] = 1.0
+                idx += 1
+    return U
+
+
+def build_cluster_pair_masks(
+    block_idx_list: List[List[int]], n: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Build pair-mask matrix M and discordant-count offsets for all clusters.
+
+    Returns
+    -------
+    M : ndarray, shape (C, n_pairs)
+        ``+1`` concordant, ``-1`` discordant, ``0`` same-block.
+    offsets : ndarray, shape (C,)
+    """
+    C = len(block_idx_list)
+    n_pairs = comb(n, 2)
+    a_idx, b_idx = np.triu_indices(n, k=1)
+    M = np.zeros((C, n_pairs), dtype=np.float64)
+    offsets = np.zeros(C, dtype=np.float64)
+    for c in range(C):
+        bidx = np.asarray(block_idx_list[c], dtype=np.intp)
+        diff = bidx[a_idx] - bidx[b_idx]
+        M[c] = np.sign(-diff)
+        offsets[c] = np.count_nonzero(diff > 0)
+    return M, offsets
+
+
+def update_pair_mask_for_item(
+    M_row: np.ndarray, offset: float,
+    block_idx: List[int], item: int, old_block: int, new_block: int, n: int,
+) -> Tuple[np.ndarray, float]:
+    """Incrementally update one row of M when *item* moves blocks.  O(n)."""
+    for x in range(n):
+        if x == item:
+            continue
+        a, b = min(item, x), max(item, x)
+        pidx = _pair_index(a, b, n)
+        bx = block_idx[x]
+        if item < x:
+            old_sign = -1.0 if old_block > bx else (1.0 if old_block < bx else 0.0)
+            new_sign = -1.0 if new_block > bx else (1.0 if new_block < bx else 0.0)
+        else:
+            old_sign = -1.0 if bx > old_block else (1.0 if bx < old_block else 0.0)
+            new_sign = -1.0 if bx > new_block else (1.0 if bx < new_block else 0.0)
+        if old_sign != new_sign:
+            if old_sign == -1.0:
+                offset -= 1
+            if new_sign == -1.0:
+                offset += 1
+            M_row[pidx] = new_sign
+    return M_row, offset
+
+
+def compute_all_disagreements_fast(
+    U_all: np.ndarray,
+    M: np.ndarray,
+    offsets: np.ndarray,
+) -> np.ndarray:
+    """Compute disagreements[i][c] for all assessors and clusters via matmul.
+
+    Returns ndarray of shape (N, C).
+    """
+    return U_all @ M.T + offsets[np.newaxis, :]
+
+
+# ── Gibbs candidate building ──────────────────────────────────
+
+def _build_base(
+    blocks: List[List[int]], block_l: int, elem_idx: int
+) -> List[List[int]]:
+    """Build the base block structure with item l removed (drop empty blocks)."""
+    base: List[List[int]] = []
+    for i, blk in enumerate(blocks):
+        if i == block_l:
+            remaining = blk[:elem_idx] + blk[elem_idx + 1:]
+            if remaining:
+                base.append(remaining)
+        else:
+            base.append(list(blk))
+    return base
+
+
+def _build_candidate(
+    base: List[List[int]], l: int, idx: int, K_minus: int
+) -> List[List[int]]:
+    """Construct the single candidate at index *idx* from the base.
+
+    Indices 0..K_minus  → "create" (insert singleton [l] at position idx).
+    Indices K_minus+1.. → "add" (append l to block idx - K_minus - 1).
+    """
+    if idx <= K_minus:
+        return [list(b) for b in base[:idx]] + [[l]] + [list(b) for b in base[idx:]]
+    else:
+        k = idx - (K_minus + 1)
+        cand = [list(b) for b in base]
+        cand[k] = cand[k] + [l]
+        return cand
+
+
+# ── main fast Gibbs entry point ───────────────────────────────
+
+def fast_gibbs_reassign_one_item(
     rankings: List[List[int]],
     blocks: List[List[int]],
     theta: float,
     gamma: float,
     delta: float,
+    H: Optional[np.ndarray] = None,
+    U_all: Optional[np.ndarray] = None,
+    cluster_mask: Optional[np.ndarray] = None,
     include_uniform_order_prior: bool = True,
     rng: Optional[random.Random] = None,
-    tiePenaltyWeight: float = 1.0
-) -> List[List[int]]:
+    tie_penalty: float = 0.5,
+) -> Tuple[List[List[int]], int, int]:
+    """Gibbs-sample a new block assignment for one randomly chosen item.
+
+    Return signature ``(new_blocks, n_proposals, n_accepts)`` matches the old
+    ``gibbs_reassign_one_item`` but runs in O(n + K) per call vs O(2K · N n log K).
+
+    Parameters
+    ----------
+    H : ndarray, optional
+        Precomputed cluster-level pairwise preferences, shape ``(comb(n, 2),)``.
+        ``H[pair_index(a, b)] = #{assessors in cluster: r[a] > r[b]}``.
+        If *None*, derived from *U_all* + *cluster_mask* or computed from scratch.
+    """
     if rng is None:
         rng = random.Random()
     if not rankings:
         return [b[:] for b in blocks], 0, 0
 
-    profiler = get_profiler()
     N = len(rankings)
     n = len(rankings[0])
 
-    x = rng.randrange(n)
-    blocks_minus, _ = remove_item_from_blocks(blocks, x)
-    K_minus = len(blocks_minus)
-    sizes_minus = [len(b) for b in blocks_minus]
+    if H is None:
+        if U_all is not None and cluster_mask is not None:
+            H = U_all[cluster_mask].sum(axis=0)
+        else:
+            U = compute_U_all(rankings, n)
+            H = U.sum(axis=0)
 
-    candidates: List[Tuple[str, int]] = []
-    logW: List[float] = []
+    l = rng.randrange(n)
+    block_index = blocks_to_block_index(blocks, n)
+    block_l = block_index[l]
+    elem_idx = blocks[block_l].index(l)
 
-    # existing blocks: compute full distance using Numba-optimized code
+    base = _build_base(blocks, block_l, elem_idx)
+    K_minus = len(base)
+
+    base_sizes = [len(b) for b in base]
+    base_block_idx = np.empty(n, dtype=np.intp)
+    base_block_idx[l] = -1
+    for k, blk in enumerate(base):
+        for item in blk:
+            base_block_idx[item] = k
+
+    items = np.arange(n)
+    xs = items[items != l]
+    a_arr = np.minimum(l, xs)
+    b_arr = np.maximum(l, xs)
+    pidx_arr = a_arr * (2 * n - a_arr - 1) // 2 + (b_arr - a_arr - 1)
+
+    h_vals = H[pidx_arr].copy()
+    flip_mask = l > xs
+    h_vals[flip_mask] = N - h_vals[flip_mask]
+
+    block_ids = base_block_idx[xs]
+    H_gt_block = np.zeros(K_minus)
+    np.add.at(H_gt_block, block_ids, h_vals)
+    H_lt_block = N * np.array(base_sizes, dtype=float) - H_gt_block
+
+    prefix_Hlt = np.empty(K_minus + 1)
+    prefix_Hlt[0] = 0.0
+    np.cumsum(H_lt_block, out=prefix_Hlt[1:])
+    suffix_Hgt = np.empty(K_minus + 1)
+    suffix_Hgt[K_minus] = 0.0
+    np.cumsum(H_gt_block[::-1], out=suffix_Hgt[:K_minus])
+    suffix_Hgt[:K_minus] = suffix_Hgt[:K_minus][::-1]
+
+    q = math.exp(-theta)
+    log_qfact = build_log_qfactorials(n, q)
+    log_gamma_1md = lgamma(1.0 - delta)
+    log_py_denom = lgamma(gamma + n) - lgamma(gamma + 1)
+
+    log_py_tables_base = 0.0
+    for i in range(1, K_minus):
+        log_py_tables_base += log(gamma + i * delta)
+
+    log_py_sizes_base = 0.0
+    for s in base_sizes:
+        log_py_sizes_base += lgamma(s - delta) - log_gamma_1md
+
+    base_Tm = sum(s * (s - 1) // 2 for s in base_sizes)
+    base_logP = sum(lgamma(s + 1) for s in base_sizes)
+    base_log_qf_sum = sum(log_qfact[s] for s in base_sizes)
+
+    log_py_create = (log_py_tables_base + log(gamma + K_minus * delta)
+                     + log_py_sizes_base - log_py_denom)
+    log_Z_create = (-theta * tie_penalty * base_Tm + base_logP
+                    + log_qfact[n] - base_log_qf_sum - log_qfact[1])
+    log_ord_create = -lgamma(K_minus + 2) if include_uniform_order_prior else 0.0
+
+    log_py_add_common = log_py_tables_base + log_py_sizes_base - log_py_denom
+    log_Z_add_base = (-theta * tie_penalty * base_Tm + base_logP
+                      + log_qfact[n] - base_log_qf_sum)
+    log_ord_add = -lgamma(K_minus + 1) if include_uniform_order_prior else 0.0
+
+    log_weights: List[float] = []
+
+    lw_create_common = log_py_create + log_ord_create - N * log_Z_create
+    for p in range(K_minus + 1):
+        contrib_l = prefix_Hlt[p] + suffix_Hgt[p]
+        log_weights.append(lw_create_common - theta * contrib_l)
+
     for k in range(K_minus):
-        w_py = sizes_minus[k] - delta
-        if w_py <= 0:
-            continue
+        s_k = base_sizes[k]
+        contrib_l = prefix_Hlt[k] + suffix_Hgt[k + 1] + tie_penalty * N * s_k
+        log_py_k = log_py_add_common + log(s_k - delta)
+        log_Z_k = (log_Z_add_base - theta * tie_penalty * s_k
+                   + log(s_k + 1) - (log_qfact[s_k + 1] - log_qfact[s_k]))
+        log_weights.append(log_py_k + log_ord_add - theta * contrib_l - N * log_Z_k)
 
-        prop = apply_move_existing_block(blocks_minus, x, k)
-        
-        # Profile distance calculation
-        if profiler:
-            t_start = time.time()
-        S = total_distance_fast(rankings, prop, tiePenaltyWeight=tiePenaltyWeight)
-        if profiler:
-            profiler.record_operation("distance_calculation", time.time() - t_start, "gibbs_reassign")
-        
-        sizes_cand = sizes_minus[:]
-        sizes_cand[k] += 1
-
-        # Profile Z* calculation
-        if profiler:
-            t_start = time.time()
-        logZ = log_Z_star_from_sizes(sizes_cand, theta, None, tiePenaltyWeight=tiePenaltyWeight)
-        if profiler:
-            profiler.record_operation("z_star_calculation", time.time() - t_start, "gibbs_reassign")
-
-        lw = math.log(w_py) - theta * S - N * logZ
-        if include_uniform_order_prior:
-            lw += -math.lgamma(K_minus + 1)
-        candidates.append(("existing", k))
-        logW.append(lw)
-
-    # new singleton at each position
-    w_new = gamma + delta * K_minus
-    if w_new > 0:
-        for pos in range(K_minus + 1):
-            prop = apply_move_new_block(blocks_minus, x, pos)
-            
-            # Profile distance calculation
-            if profiler:
-                t_start = time.time()
-            S = total_distance_fast(rankings, prop, tiePenaltyWeight=tiePenaltyWeight)
-            if profiler:
-                profiler.record_operation("distance_calculation", time.time() - t_start, "gibbs_reassign")
-            
-            sizes_cand = sizes_minus[:]
-            sizes_cand.insert(pos, 1)
-            K_cand = K_minus + 1
-
-            # Profile Z* calculation
-            if profiler:
-                t_start = time.time()
-            logZ = log_Z_star_from_sizes(sizes_cand, theta, None, tiePenaltyWeight=tiePenaltyWeight)
-            if profiler:
-                profiler.record_operation("z_star_calculation", time.time() - t_start, "gibbs_reassign")
-
-            lw = math.log(w_new) - theta * S - N * logZ
-            if include_uniform_order_prior:
-                lw += -math.lgamma(K_cand + 1)
-            candidates.append(("new", pos))
-            logW.append(lw)
-
-    if not candidates:
-        return [b[:] for b in blocks], 0, 0
-
-    # Profile sampling operation
-    if profiler:
-        t_start = time.time()
-    idx = sample_categorical_from_logweights(logW, rng)
-    if profiler:
-        profiler.record_operation("sampling", time.time() - t_start, "gibbs_reassign")
-    
-    kind, where = candidates[idx]
-    out = apply_move_existing_block(blocks_minus, x, where) if kind == "existing" else apply_move_new_block(blocks_minus, x, where)
-    # Gibbs is a single proposal and is always considered accepted (collapsed Gibbs)
-    return out, 1, 1
+    idx = sample_categorical_from_logweights(log_weights, rng)
+    chosen = _build_candidate(base, l, idx, K_minus)
+    return chosen, 1, 1
 
 
-# ------------------------------------------------------------
-# New MH move: propose item reassignment from PY prior only
-# ------------------------------------------------------------
-def mh_py_prior_reassign_one_item(
-    rankings_c: List[List[int]],
+# ── greedy (ICM) variant ─────────────────────────────────────
+
+def _compute_item_logweights(
     blocks: List[List[int]],
+    l: int,
     theta: float,
     gamma: float,
     delta: float,
-    *,
-    rng: random.Random,
-    blocks_old: Optional[List[List[int]]] = None,
-    distance_calculator=None,
-    use_parallel: bool = False,
-    posterior_cache: Optional[dict] = None,
-) -> Tuple[List[List[int]], Optional[int], Optional[int]]:
-    """MH update: remove a random item and reassign it using PY prior weights.
+    H: np.ndarray,
+    N: int,
+    n: int,
+    tie_penalty: float = 0.5,
+    include_uniform_order_prior: bool = True,
+) -> Tuple[List[float], List[List[int]], int]:
+    """Compute log-weights for all candidate placements of item *l*."""
+    block_index = blocks_to_block_index(blocks, n)
+    block_l = block_index[l]
+    elem_idx = blocks[block_l].index(l)
 
-    The proposal ignores the likelihood (distance) term and samples new block
-    placement according to the Pitman–Yor prior.  The acceptance probability is
-    based solely on the ratio of posterior probabilities (likelihood+prior).
+    base = _build_base(blocks, block_l, elem_idx)
+    K_minus = len(base)
 
-    Parameters
-    ----------
-    posterior_cache : dict, optional
-        Cache mapping (blocks_tuple, theta, gamma, delta) → posterior_value.
-        If provided, lp_old will be retrieved from cache if blocks+params match,
-        avoiding redundant computation when parameters don't change between iterations.
-        The cache is updated in-place with lp_old for use in next iteration.
+    base_sizes = [len(b) for b in base]
+    base_block_idx = np.empty(n, dtype=np.intp)
+    base_block_idx[l] = -1
+    for k, blk in enumerate(base):
+        for item in blk:
+            base_block_idx[item] = k
 
-    Returns a tuple ``(blocks_out, n_proposals, n_accepts)`` as with other
-    MH helpers.
-    """
-    if not rankings_c:
-        return blocks, 0, 0
-    K = len(blocks)
-    if K == 0:
-        return blocks, 0, 0
+    items = np.arange(n)
+    xs = items[items != l]
+    a_arr = np.minimum(l, xs)
+    b_arr = np.maximum(l, xs)
+    pidx_arr = a_arr * (2 * n - a_arr - 1) // 2 + (b_arr - a_arr - 1)
+    h_vals = H[pidx_arr].copy()
+    h_vals[l > xs] = N - h_vals[l > xs]
 
-    profiler = get_profiler()
+    H_gt_block = np.zeros(K_minus)
+    np.add.at(H_gt_block, base_block_idx[xs], h_vals)
+    H_lt_block = N * np.array(base_sizes, dtype=float) - H_gt_block
 
-    # pick a random item and remove it
-    n = len(rankings_c[0])
-    x = rng.randrange(n)
-    blocks_minus, _ = remove_item_from_blocks(blocks, x)
-    K_minus = len(blocks_minus)
-    sizes_minus = [len(b) for b in blocks_minus]
+    prefix_Hlt = np.empty(K_minus + 1)
+    prefix_Hlt[0] = 0.0
+    np.cumsum(H_lt_block, out=prefix_Hlt[1:])
+    suffix_Hgt = np.empty(K_minus + 1)
+    suffix_Hgt[K_minus] = 0.0
+    np.cumsum(H_gt_block[::-1], out=suffix_Hgt[:K_minus])
+    suffix_Hgt[:K_minus] = suffix_Hgt[:K_minus][::-1]
 
-    # compute PY prior weights
-    weights: List[float] = []
-    candidates: List[Tuple[str, Optional[int]]] = []
+    q = math.exp(-theta)
+    log_qfact = build_log_qfactorials(n, q)
+    log_gamma_1md = lgamma(1.0 - delta)
+    log_py_denom = lgamma(gamma + n) - lgamma(gamma + 1)
+
+    log_py_tables_base = sum(log(gamma + i * delta) for i in range(1, K_minus))
+    log_py_sizes_base = sum(lgamma(s - delta) - log_gamma_1md for s in base_sizes)
+
+    base_Tm = sum(s * (s - 1) // 2 for s in base_sizes)
+    base_logP = sum(lgamma(s + 1) for s in base_sizes)
+    base_log_qf_sum = sum(log_qfact[s] for s in base_sizes)
+
+    log_py_create = (log_py_tables_base + log(gamma + K_minus * delta)
+                     + log_py_sizes_base - log_py_denom)
+    log_Z_create = (-theta * tie_penalty * base_Tm + base_logP
+                    + log_qfact[n] - base_log_qf_sum - log_qfact[1])
+    log_ord_create = -lgamma(K_minus + 2) if include_uniform_order_prior else 0.0
+
+    log_py_add_common = log_py_tables_base + log_py_sizes_base - log_py_denom
+    log_Z_add_base = (-theta * tie_penalty * base_Tm + base_logP
+                      + log_qfact[n] - base_log_qf_sum)
+    log_ord_add = -lgamma(K_minus + 1) if include_uniform_order_prior else 0.0
+
+    log_weights: List[float] = []
+    lw_create_common = log_py_create + log_ord_create - N * log_Z_create
+    for p in range(K_minus + 1):
+        log_weights.append(lw_create_common - theta * (prefix_Hlt[p] + suffix_Hgt[p]))
     for k in range(K_minus):
-        w_py = sizes_minus[k] - delta
-        if w_py > 0:
-            candidates.append(("existing", k))
-            weights.append(w_py)
-    w_new = gamma + delta * K_minus
-    if w_new > 0:
-        candidates.append(("new", None))
-        weights.append(w_new)
+        s_k = base_sizes[k]
+        contrib_l = prefix_Hlt[k] + suffix_Hgt[k + 1] + tie_penalty * N * s_k
+        log_py_k = log_py_add_common + log(s_k - delta)
+        log_Z_k = (log_Z_add_base - theta * tie_penalty * s_k
+                   + log(s_k + 1) - (log_qfact[s_k + 1] - log_qfact[s_k]))
+        log_weights.append(log_py_k + log_ord_add - theta * contrib_l - N * log_Z_k)
 
-    if not candidates:
-        return blocks, 0, 0
-
-    # sample candidate according to log weights
-    if profiler:
-        t_start = time.time()
-    idx = sample_categorical_from_logweights([math.log(w) for w in weights], rng)
-    if profiler:
-        profiler.record_operation("sampling", time.time() - t_start, "mh_py_reassign")
-    
-    kind, where = candidates[idx]
-    if kind == "existing":
-        prop = apply_move_existing_block(blocks_minus, x, where)  # type: ignore
-    else:
-        # choose a random insertion position for the new singleton
-        pos = rng.randrange(K_minus + 1)
-        prop = apply_move_new_block(blocks_minus, x, pos)
-
-    # compute MH acceptance based on full posterior
-    # OPTIMIZATION: Check posterior cache to avoid recalculation when theta/gamma/delta unchanged
-    cache_key = (tuple(tuple(b) for b in blocks), theta, gamma, delta)
-    if posterior_cache is not None and cache_key in posterior_cache:
-        lp_old = posterior_cache[cache_key]
-        if profiler:
-            profiler.record_operation("posterior_calculation (cached)", 0.0, "mh_py_reassign")
-    else:
-        if profiler:
-            t_start = time.time()
-        # Use distance_calculator consistently for both old and new
-        # blocks_old=None ensures full distance calculation (no incremental for baseline)
-        lp_old = log_blocks_posterior(rankings_c, blocks, theta, gamma, delta,
-                                      blocks_old=None, distance_calculator=distance_calculator, parallel=use_parallel)
-        if profiler:
-            profiler.record_operation("posterior_calculation", time.time() - t_start, "mh_py_reassign")
-        # Store in cache for next iteration
-        if posterior_cache is not None:
-            posterior_cache[cache_key] = lp_old
-    
-    if profiler:
-        t_start = time.time()
-    # Use distance_calculator consistently; blocks_old allows incremental if beneficial
-    lp_new = log_blocks_posterior(rankings_c, prop, theta, gamma, delta,
-                                  blocks_old=blocks, distance_calculator=distance_calculator, parallel=use_parallel)
-    if profiler:
-        profiler.record_operation("posterior_calculation", time.time() - t_start, "mh_py_reassign")
-    
-    # Update cache with new state for next iteration if move accepted
-    # This will be overwritten if move is rejected, which is correct behavior
-    new_cache_key = (tuple(tuple(b) for b in prop), theta, gamma, delta)
-    if posterior_cache is not None:
-        posterior_cache[new_cache_key] = lp_new
-    
-    log_acc = lp_new - lp_old
-    if math.log(rng.random()) < log_acc:
-        return prop, 1, 1
-    return blocks, 1, 0
+    return log_weights, base, K_minus
 
 
-# ============================================================
-# ---------- MH moves ----------
+def greedy_reassign_one_item(
+    blocks: List[List[int]],
+    l: int,
+    theta: float,
+    gamma: float,
+    delta: float,
+    H: np.ndarray,
+    N: int,
+    n: int,
+    tie_penalty: float = 0.5,
+) -> Tuple[List[List[int]], bool]:
+    """Deterministic ICM move: place item *l* at its MAP position."""
+    log_weights, base, K_minus = _compute_item_logweights(
+        blocks, l, theta, gamma, delta, H, N, n, tie_penalty)
+    idx = int(np.argmax(log_weights))
+    new_blocks = _build_candidate(base, l, idx, K_minus)
+    changed = (tuple(tuple(sorted(b)) for b in new_blocks)
+               != tuple(tuple(sorted(b)) for b in blocks))
+    return new_blocks, changed
 
 
-def mh_adjacent_split_merge(
-    rankings_c: List[List[int]],
+def icm_sweep_cluster(
     blocks: List[List[int]],
     theta: float,
     gamma: float,
     delta: float,
-    *,
-    rng: random.Random,
-    p_merge: float = 0.5,
-) -> Tuple[List[List[int]], Optional[int], Optional[int]]:
-    K = len(blocks)
-    if K == 0:
-        return blocks, 0, 0
+    H: np.ndarray,
+    N: int,
+    n: int,
+    tie_penalty: float = 0.5,
+    max_sweeps: int = 50,
+) -> Tuple[List[List[int]], int, int]:
+    """Run ICM sweeps over all items until convergence.
 
-    profiler = get_profiler()
-
-    # Profile posterior calculation (old)
-    if profiler:
-        t_start = time.time()
-    lp_old = log_blocks_posterior(rankings_c, blocks, theta, gamma, delta)
-    if profiler:
-        profiler.record_operation("posterior_calculation", time.time() - t_start, "mh_splitmerge")
-
-    splittable = [j for j, b in enumerate(blocks) if len(b) >= 2]
-    can_split = bool(splittable)
-    can_merge = (K >= 2)
-    if not can_split and not can_merge:
-        return blocks, 0, 0
-
-    do_merge = (rng.random() < p_merge)
-    if do_merge and not can_merge:
-        do_merge = False
-    if (not do_merge) and not can_split:
-        do_merge = True
-
-    if do_merge:
-        j = rng.randrange(K - 1)
-        bL = blocks[j]
-        bR = blocks[j + 1]
-        prop = [b[:] for b in blocks]
-        prop[j] = bL[:] + bR[:]
-        del prop[j + 1]
-
-        # Profile posterior calculation (new)
-        if profiler:
-            t_start = time.time()
-        lp_new = log_blocks_posterior(rankings_c, prop, theta, gamma, delta)
-        if profiler:
-            profiler.record_operation("posterior_calculation", time.time() - t_start, "mh_splitmerge")
-
-        log_q_fwd = math.log(p_merge) + math.log(1.0 / (K - 1))
-
-        # reverse split must pick merged block and reconstruct exact (bL, bR)
-        s = len(prop[j])
-        splittable2 = [jj for jj, bb in enumerate(prop) if len(bb) >= 2]
-        if not splittable2:
-            return blocks, 0, 0
-
-        a = len(bL)
-        log_q_bwd = (
-            math.log(1.0 - p_merge)
-            + math.log(1.0 / len(splittable2))
-            + math.log(1.0 / (s - 1))
-            - math.log(math.comb(s, a))
-        )
-    else:
-        j = rng.choice(splittable)
-        block = blocks[j]
-        s = len(block)
-        a = rng.randrange(1, s)
-        A = rng.sample(block, a)
-        Aset = set(A)
-        B = [x for x in block if x not in Aset]
-
-        prop = [b[:] for b in blocks]
-        prop[j] = A[:]
-        prop.insert(j + 1, B[:])
-
-        # Profile posterior calculation (new - split case)
-        if profiler:
-            t_start = time.time()
-        lp_new = log_blocks_posterior(rankings_c, prop, theta, gamma, delta)
-        if profiler:
-            profiler.record_operation("posterior_calculation", time.time() - t_start, "mh_splitmerge")
-
-        log_q_fwd = (
-            math.log(1.0 - p_merge)
-            + math.log(1.0 / len(splittable))
-            + math.log(1.0 / (s - 1))
-            - math.log(math.comb(s, a))
-        )
-        K2 = len(prop)
-        log_q_bwd = math.log(p_merge) + math.log(1.0 / (K2 - 1))
-
-    log_acc = (lp_new - lp_old) + (log_q_bwd - log_q_fwd)
-    if math.log(rng.random()) <log_acc:
-        return prop, 1, 1
-    return blocks, 1, 0
-
-
-def mh_adjacent_item_transfer(
-    rankings_c: List[List[int]],
-    blocks: List[List[int]],
-    theta: float,
-    gamma: float,
-    delta: float,
-    *,
-    rng: random.Random,
-    blocks_old: Optional[List[List[int]]] = None,
-    distance_calculator=None,
-    use_parallel: bool = False,
-    posterior_cache: Optional[dict] = None,
-) -> Tuple[List[List[int]], Optional[int], Optional[int]]:
-    K = len(blocks)
-    if K < 2:
-        return blocks, 0, 0
-
-    profiler = get_profiler()
-
-    moves = []
-    for j in range(K - 1):
-        if len(blocks[j]) >= 2:
-            moves.append((j, +1))
-        if len(blocks[j + 1]) >= 2:
-            moves.append((j, -1))
-    if not moves:
-        return blocks, 0, 0
-
-    j, direction = rng.choice(moves)
-    donor, recv = (j, j + 1) if direction == +1 else (j + 1, j)
-    x = rng.choice(blocks[donor])
-
-    # build proposal
-    prop = [b[:] for b in blocks]
-    prop[donor].remove(x)
-    prop[recv].append(x)
-
-    # compute likelihoods using Numba-optimized distance
-    # OPTIMIZATION: Check posterior cache to avoid recalculation when theta/gamma/delta unchanged
-    cache_key = (tuple(tuple(b) for b in blocks), theta, gamma, delta)
-    if posterior_cache is not None and cache_key in posterior_cache:
-        lp_old = posterior_cache[cache_key]
-        if profiler:
-            profiler.record_operation("posterior_calculation (cached)", 0.0, "mh_transfer")
-    else:
-        if profiler:
-            t_start = time.time()
-        lp_old = log_blocks_posterior(rankings_c, blocks, theta, gamma, delta,
-                                      blocks_old=None, distance_calculator=None)
-        if profiler:
-            profiler.record_operation("posterior_calculation", time.time() - t_start, "mh_transfer")
-        # Store in cache for next iteration
-        if posterior_cache is not None:
-            posterior_cache[cache_key] = lp_old
-    
-    if profiler:
-        t_start = time.time()
-    lp_new = log_blocks_posterior(rankings_c, prop, theta, gamma, delta,
-                                  blocks_old=blocks, distance_calculator=distance_calculator,
-                                  parallel=use_parallel)
-    if profiler:
-        profiler.record_operation("posterior_calculation", time.time() - t_start, "mh_transfer")
-    
-    # Update cache with new state for next iteration if move accepted
-    new_cache_key = (tuple(tuple(b) for b in prop), theta, gamma, delta)
-    if posterior_cache is not None:
-        posterior_cache[new_cache_key] = lp_new
-
-    log_q_fwd = -math.log(len(moves)) - math.log(len(blocks[donor]))
-
-    # check if reverse move is possible
-    moves2 = []
-    for jj in range(K - 1):
-        if len(prop[jj]) >= 2:
-            moves2.append((jj, +1))
-        if len(prop[jj + 1]) >= 2:
-            moves2.append((jj, -1))
-    if not moves2 or (j, -direction) not in moves2:
-        return blocks, 0, 0
-
-    rev_donor = recv
-    log_q_bwd = -math.log(len(moves2)) - math.log(len(prop[rev_donor]))
-
-    log_acc = (lp_new - lp_old) + (log_q_bwd - log_q_fwd)
-    if math.log(rng.random()) < log_acc:
-        return prop, 1, 1
-    return blocks, 1, 0
-
-
-def _swap_adjacent(blocks: List[List[int]], j: int) -> List[List[int]]:
-    nb = [b[:] for b in blocks]
-    nb[j], nb[j + 1] = nb[j + 1], nb[j]
-    return nb
-
-
-def _move_block_to_index(blocks: List[List[int]], j_from: int, j_to_final: int) -> List[List[int]]:
-    K = len(blocks)
-    if not (0 <= j_from < K and 0 <= j_to_final < K):
-        raise ValueError("Invalid indices for move_block.")
-    if j_from == j_to_final:
-        return [b[:] for b in blocks]
-    nb = [b[:] for b in blocks]
-    blk = nb.pop(j_from)
-    ins = j_to_final - 1 if j_to_final > j_from else j_to_final
-    nb.insert(ins, blk)
-    return nb
-
-
-def _feasible_shift_positions(K: int, j: int, max_step: int) -> List[int]:
-    lo = max(0, j - max_step)
-    hi = min(K - 1, j + max_step)
-    return [p for p in range(lo, hi + 1) if p != j]
-
-
-def mh_ordering_swap_or_shift(
-    rankings_c: List[List[int]],
-    blocks: List[List[int]],
-    theta: float,
-    gamma: float,
-    delta: float,
-    *,
-    rng: random.Random,
-    p_short: float = 0.75,
-    n_swap_steps: Optional[int] = None,
-    max_long_step: Optional[int] = None,
-    blocks_old: Optional[List[List[int]]] = None,
-    distance_calculator=None,
-    use_parallel: bool = False,
-    posterior_cache: Optional[dict] = None,
-) -> Tuple[List[List[int]], Optional[int], Optional[int]]:
+    Returns ``(blocks, total_moves, sweeps_done)``.
     """
-    Reorder blocks with minimal moves by default: 1 adjacent swap OR 1-position shift.
-    
-    This version uses minimal moves (1 swap, 1-position shifts) as the default,
-    which empirically achieves ~69% acceptance rate. Longer moves can be enabled
-    via n_swap_steps and max_long_step parameters for experimentation.
-    
-    Parameters
-    ----------
-    n_swap_steps : int, optional
-        Number of adjacent swaps to perform. Default: 1 (minimal).
-        Set to None for adaptive: max(1, sqrt(K)) [old behavior]
-        Set explicitly for different lengths (e.g., 3 for more exploratory moves)
-    max_long_step : int, optional
-        Maximum distance for shift moves. Default: 1 (adjacent positions only).
-        Set to None for adaptive: min(K-1, K/2) [old behavior]
-        Set explicitly for different ranges (e.g., 2 or 3 for wider exploration)
-    blocks_old : list of lists, optional
-        Previous block structure (enables incremental distance calculation)
-    distance_calculator : object, optional
-        IncrementalDistanceCalculator for fast incremental updates
-    use_parallel : bool
-        Use parallel computation for distance calculation
-    """
-    K = len(blocks)
-    if K <= 1:
-        return blocks, 0, 0
-    
-    # DEFAULT: Minimal moves (proven to work well at 69% acceptance)
-    # Use 1 swap step and 1-position shifts unless explicitly overridden
-    if n_swap_steps is None:
-        n_swap_steps = 1  # Minimal: single adjacent swap
-    if max_long_step is None:
-        max_long_step = 1  # Minimal: adjacent positions only
-
-    profiler = get_profiler()
-
-    # Profile posterior calculation (old) - use cache to avoid recomputation
-    cache_key = (tuple(tuple(b) for b in blocks), theta, gamma, delta)
-    if posterior_cache is not None and cache_key in posterior_cache:
-        lp_old = posterior_cache[cache_key]
-        if profiler:
-            profiler.record_operation("posterior_calculation (cached)", 0.0, "mh_swapshift")
-    else:
-        if profiler:
-            t_start = time.time()
-        lp_old = log_blocks_posterior(rankings_c, blocks, theta, gamma, delta,
-                                      blocks_old=None, distance_calculator=None)
-        if profiler:
-            profiler.record_operation("posterior_calculation", time.time() - t_start, "mh_swapshift")
-        if posterior_cache is not None:
-            posterior_cache[cache_key] = lp_old
-
-    if rng.random() < p_short:
-        # Short move: adjacent swaps
-        prop = [b[:] for b in blocks]
-        for _ in range(n_swap_steps):
-            j = rng.randrange(K - 1)
-            prop = _swap_adjacent(prop, j)
-
-        # Profile posterior calculation (new - short swaps)
-        if profiler:
-            t_start = time.time()
-        lp_new = log_blocks_posterior(rankings_c, prop, theta, gamma, delta,
-                                      blocks_old=blocks, distance_calculator=distance_calculator,
-                                      parallel=use_parallel)
-        if profiler:
-            profiler.record_operation("posterior_calculation", time.time() - t_start, "mh_swapshift")
-        
-        # Update cache for potential reuse
-        new_cache_key = (tuple(tuple(b) for b in prop), theta, gamma, delta)
-        if posterior_cache is not None:
-            posterior_cache[new_cache_key] = lp_new
-        
-        if math.log(rng.random()) < (lp_new - lp_old):
-            return prop, 1, 1
-        return blocks, 1, 0
-
-    # Long move: block shifts
-    j_from = rng.randrange(K)
-    feasible = _feasible_shift_positions(K, j_from, max_long_step)
-    if not feasible:
-        return blocks, 0, 0
-
-    j_to = rng.choice(feasible)
-    prop = _move_block_to_index(blocks, j_from, j_to)
-    
-    # Profile posterior calculation (new - long shift)
-    if profiler:
-        t_start = time.time()
-    lp_new = log_blocks_posterior(rankings_c, prop, theta, gamma, delta,
-                                  blocks_old=blocks, distance_calculator=distance_calculator,
-                                  parallel=use_parallel)
-    if profiler:
-        profiler.record_operation("posterior_calculation", time.time() - t_start, "mh_swapshift")
-
-    # Update cache for potential reuse
-    new_cache_key = (tuple(tuple(b) for b in prop), theta, gamma, delta)
-    if posterior_cache is not None:
-        posterior_cache[new_cache_key] = lp_new
-
-    feasible_rev = _feasible_shift_positions(K, j_to, max_long_step)
-    if not feasible_rev:
-        return blocks, 0, 0
-
-    log_q_fwd = math.log(1.0 - p_short) - math.log(K) - math.log(len(feasible))
-    log_q_bwd = math.log(1.0 - p_short) - math.log(K) - math.log(len(feasible_rev))
-
-    log_acc = (lp_new - lp_old) + (log_q_bwd - log_q_fwd)
-    if math.log(rng.random()) < log_acc:
-        return prop, 1, 1
-    return blocks, 1, 0
+    total_moves = 0
+    for sweep in range(max_sweeps):
+        sweep_moves = 0
+        for l in range(n):
+            blocks, changed = greedy_reassign_one_item(
+                blocks, l, theta, gamma, delta, H, N, n, tie_penalty)
+            if changed:
+                sweep_moves += 1
+        total_moves += sweep_moves
+        if sweep_moves == 0:
+            return blocks, total_moves, sweep + 1
+    return blocks, total_moves, max_sweeps
