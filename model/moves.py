@@ -67,24 +67,19 @@ def compute_U_all(
     Rankings are in position→item format (strict_r[pos] = item).
     We invert each ranking to get item→position, then compare positions.
 
-    Returns U_all of shape ``(N, comb(n, 2))`` where
+    Returns U_all of shape ``(N, comb(n, 2))`` with dtype **int8** where
     ``U_all[i, pair_index(a, b)] = 1`` iff item *a* is ranked **after**
     item *b* by assessor *i* (i.e. position_of(a) > position_of(b)).
+
+    Values are binary (0/1) so int8 is lossless and uses 8× less memory
+    than float64.  At N=2500, n=1200 this reduces U_all from ~14 GB to
+    ~1.8 GB.
     """
-    N = len(rankings)
-    n_pairs = comb(n, 2)
-    U = np.zeros((N, n_pairs), dtype=np.float64)
-    for i in range(N):
-        r = rankings[i]
-        inv_r = [0] * n
-        for pos in range(n):
-            inv_r[r[pos]] = pos
-        idx = 0
-        for a in range(n):
-            for b in range(a + 1, n):
-                if inv_r[a] > inv_r[b]:
-                    U[i, idx] = 1.0
-                idx += 1
+    a_idx, b_idx = np.triu_indices(n, k=1)
+    # inv_r[i, item] = position of that item for assessor i
+    R = np.array(rankings, dtype=np.intp)          # (N, n)  position→item
+    inv_r = np.argsort(R, axis=1).astype(np.intp)  # (N, n)  item→position
+    U = (inv_r[:, a_idx] > inv_r[:, b_idx]).view(np.uint8).astype(np.int8)
     return U
 
 
@@ -145,9 +140,13 @@ def compute_all_disagreements_fast(
 ) -> np.ndarray:
     """Compute disagreements[i][c] for all assessors and clusters via matmul.
 
-    Returns ndarray of shape (N, C).
+    U_all is expected to be float32 (as stored by MixtureRankingModel._U_all).
+    M may be float64; it will be cast to float32 for an efficient sgemm.
+
+    Returns ndarray of shape (N, C), float64.
     """
-    return U_all @ M.T + offsets[np.newaxis, :]
+    M_f32 = M.T.astype(np.float32) if M.dtype != np.float32 else M.T
+    return (U_all @ M_f32).astype(np.float64) + offsets[np.newaxis, :]
 
 
 # ── Gibbs candidate building ──────────────────────────────────

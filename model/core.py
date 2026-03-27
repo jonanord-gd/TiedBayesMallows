@@ -38,12 +38,13 @@ from .moves import (
 )
 from .priors import build_log_qfactorials
 
-# Numba support
+# Optional PyTorch GPU support — gracefully absent if not installed
 try:
-    from numba import njit
-    _USE_NUMBA = True
+    import torch as _torch
+    _TORCH_AVAILABLE = True
 except ImportError:
-    _USE_NUMBA = False
+    _torch = None  # type: ignore
+    _TORCH_AVAILABLE = False
 
 
 class MixtureRankingModel:
@@ -218,19 +219,40 @@ class MixtureRankingModel:
             z0 = [self.rng.randrange(self.C) for _ in range(self.N)]
             tau0 = dirichlet_sample(self.init_mu, self.rng)
         
-        self.state = MixtureState(clusters=init_clusters, z=z0, tau=tau0)
+        self.state = MixtureState(clusters=init_clusters, z=np.array(z0, dtype=np.intp), tau=tau0)
 
         # per-cluster caches (updated when blocks change)
         self._rebuild_all_cluster_caches()
 
-        # Precompute per-assessor pairwise preference matrix (O(N n^2), done once)
-        self._U_all = compute_U_all(rankings, self.n)
+        # Precompute per-assessor pairwise preference matrix (O(N n^2), done once).
+        # Stored as float32: exact for 0/1 values, avoids per-iteration cast in matmul.
+        self._U_all = compute_U_all(rankings, self.n).astype(np.float32)
 
         # Precompute initial M / offsets for all clusters (cached across iterations)
         block_idx_list = [self._cache[c].block_idx for c in range(self.C)]
         self._M, self._offsets = build_cluster_pair_masks(block_idx_list, self.n)
+        # _M_f32_T: contiguous (n_pairs, C) float32 transpose — reused every matmul
+        self._M_f32_T: np.ndarray = np.ascontiguousarray(self._M.T, dtype=np.float32)
         self._M_dirty = [False] * self.C
         self._triu_indices = np.triu_indices(self.n, k=1)  # reused every rebuild
+
+        # ── GPU acceleration ──────────────────────────────────────────────────
+        # When a CUDA device is found, U_all and M are stored exclusively on GPU.
+        # self._U_all is set to None to release CPU RAM (can be several GB for
+        # large n).  All matmul and H-sum operations go through _U_row_sum() and
+        # _compute_all_disagreements(), which dispatch to GPU or CPU automatically.
+        self._gpu: Optional[Any] = None  # torch.device, or None when CPU-only
+        self._U_all_t: Optional[Any] = None   # GPU tensor (N, n_pairs) float32
+        self._M_t: Optional[Any] = None       # GPU tensor (n_pairs, C) float32
+        self._offsets_t: Optional[Any] = None # GPU tensor (C,) float32
+        if _TORCH_AVAILABLE and _torch.cuda.is_available():
+            self._gpu = _torch.device("cuda")
+            self._U_all_t = _torch.from_numpy(self._U_all).to(self._gpu)
+            self._M_t = _torch.from_numpy(self._M_f32_T).to(self._gpu)
+            self._offsets_t = _torch.from_numpy(
+                self._offsets.astype(np.float32)).to(self._gpu)
+            # Free the CPU copy — GPU tensor is the sole owner from here on
+            self._U_all = None  # type: ignore
 
         # Initiate samples from MCMC run
         self.samples: Optional[MCMCSamples] = None
@@ -246,8 +268,16 @@ class MixtureRankingModel:
         self.verbose = verbose
         if self.verbose:
             print(f"[Model] Initialized ({self.N} assessors, {self.n} items, {self.C} clusters)")
-            print(f"[Model] Numba JIT: {'enabled' if _USE_NUMBA else 'disabled'}")
+            if self._gpu is not None:
+                print(f"[Model] GPU acceleration: {_torch.cuda.get_device_name(0)} "
+                      f"({_torch.cuda.get_device_properties(0).total_memory // 2**20} MB VRAM)")
+            else:
+                _reason = ("disabled" if not _TORCH_AVAILABLE else
+                           "no CUDA device" if not _torch.cuda.is_available() else "unknown")
+                print(f"[Model] GPU acceleration: unavailable ({_reason})")
             print(f"[Model] Parallelization threshold: N >= {self.parallel_threshold_n if self.parallel_threshold_n != float('inf') else 'disabled'}")
+            from .distance import _USE_NUMBA as _dist_numba
+            print(f"[Model] Numba JIT (distance): {'enabled' if _dist_numba else 'disabled'}")
             for c, cl in enumerate(self.state.clusters):
                 K = len(cl.blocks)
                 print(f"  Cluster {c}: {K} blocks, theta={cl.theta:.3f}, gamma={cl.gamma:.3f}, delta={cl.delta:.3f}")
@@ -281,7 +311,19 @@ class MixtureRankingModel:
         self._cache: List[MixtureRankingModel._ClusterCache] = [None] * self.C  # type: ignore
         for c in range(self.C):
             self._rebuild_cluster_cache(c)
-    
+
+    def _U_row_sum(self, mask: np.ndarray) -> np.ndarray:
+        """Sum U_all rows selected by a boolean mask. Returns float64 (n_pairs,).
+
+        Dispatches to GPU when available; otherwise uses CPU numpy. The result
+        is always returned as a CPU numpy array for compatibility with downstream
+        Python / scipy code.
+        """
+        if self._gpu is not None:
+            mask_t = _torch.from_numpy(mask).to(self._gpu)
+            return self._U_all_t[mask_t].sum(dim=0).cpu().numpy().astype(np.float64)
+        return self._U_all[mask].sum(axis=0)
+
     # -----------------------
     # core updates
     # -----------------------
@@ -300,6 +342,7 @@ class MixtureRankingModel:
         """
         a_idx, b_idx = self._triu_indices
 
+        any_dirty = False
         for c in range(self.C):
             if self._M_dirty[c]:
                 bidx_arr = np.asarray(self._cache[c].block_idx, dtype=np.intp)
@@ -307,8 +350,21 @@ class MixtureRankingModel:
                 self._M[c] = np.sign(-diff)
                 self._offsets[c] = np.count_nonzero(diff > 0)
                 self._M_dirty[c] = False
+                any_dirty = True
+        if any_dirty:
+            # Rebuild the cached contiguous float32 transpose used by the matmul
+            np.copyto(self._M_f32_T, self._M.T)
+            if self._gpu is not None:
+                # Push updated M and offsets to GPU
+                self._M_t.copy_(_torch.from_numpy(self._M_f32_T))
+                self._offsets_t.copy_(_torch.from_numpy(
+                    self._offsets.astype(np.float32)))
 
-        D = compute_all_disagreements_fast(self._U_all, self._M, self._offsets)
+        if self._gpu is not None:
+            D_t = _torch.mm(self._U_all_t, self._M_t)
+            D = D_t.cpu().numpy().astype(np.float64) + self._offsets[np.newaxis, :]
+        else:
+            D = self._U_all @ self._M_f32_T + self._offsets[np.newaxis, :]
         self._D_cache = D
         return D
 
@@ -326,7 +382,7 @@ class MixtureRankingModel:
         tie_penalty = self.cfg.tie_penalty
 
         # Per-cluster scalars (computed once per iteration)
-        log_tau = np.array([math.log(t) for t in state.tau])
+        log_tau = np.log(np.asarray(state.tau, dtype=np.float64))
         thetas = np.array([state.clusters[c].theta for c in range(C)])
 
         # Cache q-factorials: rebuild only when theta changes
@@ -358,7 +414,8 @@ class MixtureRankingModel:
             np.random.default_rng(self.rng.randint(0, 2**31)).random((self.N, C))
         ))
         z_new = np.argmax(logweights + gumbels, axis=1)
-        state.z = z_new.tolist()
+        # Keep as ndarray — avoids .tolist() here and np.array() in every cluster_mask
+        state.z = z_new
 
     def _update_tau(self) -> None:
         # Cache self references to eliminate attribute lookup overhead
@@ -366,11 +423,9 @@ class MixtureRankingModel:
         rng = self.rng
         C = self.C
         init_mu = self.init_mu
-        
-        counts = [0] * C
-        for zi in state.z:
-            counts[zi] += 1
-        post = [init_mu[c] + counts[c] for c in range(C)]
+
+        counts = np.bincount(state.z, minlength=C)
+        post = [init_mu[c] + int(counts[c]) for c in range(C)]
         state.tau = dirichlet_sample(post, rng)
 
     def _cluster_rankings(self, c: int) -> List[List[int]]:
@@ -413,7 +468,7 @@ class MixtureRankingModel:
         # S_c from cached D matrix (computed during _update_z): column sum
         # D[i,c] = cross-block disagreements; add tie penalty for full distance
         if hasattr(self, '_D_cache') and self._D_cache is not None:
-            cluster_mask = np.array([zi == c for zi in state.z], dtype=bool)
+            cluster_mask = state.z == c
             S_c = float(self._D_cache[cluster_mask, c].sum()) + tie_penalty * cc.Tm * n_c
         else:
             S_c = total_distance_fast(rankings_c, cl.blocks, tie_penalty)
@@ -470,8 +525,8 @@ class MixtureRankingModel:
         proposals = 0
         accepts = 0
 
-        cluster_mask = np.array([zi == c for zi in state.z], dtype=bool)
-        _fast_H = self._U_all[cluster_mask].sum(axis=0)
+        cluster_mask = state.z == c
+        _fast_H = self._U_row_sum(cluster_mask)
 
         for _ in range(n_item_moves):
             t_move_start = time.time()
@@ -1017,7 +1072,7 @@ class MixtureRankingModel:
                     })
                     continue
 
-                H_c = self._U_all[mask].sum(axis=0)
+                H_c = self._U_row_sum(mask)
                 cl = self.state.clusters[c]
 
                 new_blocks, total_moves, sweeps = icm_sweep_cluster(
@@ -1121,8 +1176,8 @@ class MixtureRankingModel:
             lp += (init_mu[c] - 1.0) * math.log(t)
 
         # z likelihood
-        for zi in state.z:
-            lp += math.log(state_tau[zi])
+        tau_arr = np.asarray(state_tau)
+        lp += float(np.log(tau_arr[state.z]).sum())
 
         # cluster blocks + theta + priors — via cached D matrix
         use_cache = hasattr(self, '_D_cache') and self._D_cache is not None
