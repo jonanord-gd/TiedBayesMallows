@@ -491,7 +491,10 @@ def init_spectral_with_z(
             borda_ranking = sorted(range(n_items), key=lambda i: mean_pos[i])
             
             preference = _build_antisymmetric_preference_matrix(agreement, borda_ranking)
-            K = _sample_pitman_yor_blocks(gamma, delta, n_items, rng)
+            if py_sampling:
+                K = _sample_pitman_yor_blocks(gamma, delta, n_items, rng)
+            else:
+                K = max(1, round(n_items / 2))
             blocks = _agglomerative_block_formation_antisymmetric(
                 borda_ranking, agreement, K
             )
@@ -516,9 +519,13 @@ def init_clusters_default(
     init_delta: float = 0.5,
     seed: Optional[int] = None,
 ) -> Tuple[List[ClusterParams], List[int]]:
-    """Trivial initialization: each cluster starts with all items in one block.
+    """Simple initialization: each cluster starts with ~n/2 blocks of size 2.
 
-    The MCMC Gibbs moves will break blocks apart from this starting point.
+    Items are grouped into consecutive pairs (0,1), (2,3), ... in their natural
+    order.  This gives max(1, ceil(n/2)) blocks per cluster, which is a neutral
+    starting point that does not bias the sampler towards many or few ties.
+
+    The MCMC Gibbs moves will merge or split blocks from this starting point.
     For better-quality initialization use ``init_spectral_with_z()`` instead.
 
     Returns
@@ -530,9 +537,13 @@ def init_clusters_default(
     n = len(rankings[0])
     N = len(rankings)
     rng = random.Random(seed)
+    # Group items into consecutive pairs → ceil(n/2) blocks
+    blocks = [[i, i + 1] for i in range(0, n - 1, 2)]
+    if n % 2 == 1:
+        blocks.append([n - 1])  # lone item when n is odd
     clusters = [
         ClusterParams(
-            blocks=[list(range(n))],
+            blocks=blocks,
             theta=init_theta,
             gamma=init_gamma,
             delta=init_delta,

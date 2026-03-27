@@ -267,17 +267,27 @@ class MixtureRankingModel:
         # Verbose logging flag
         self.verbose = verbose
         if self.verbose:
-            print(f"[Model] Initialized ({self.N} assessors, {self.n} items, {self.C} clusters)")
+            n_pairs = self.n * (self.n - 1) // 2
+            u_bytes = self.N * n_pairs * 4  # float32 = 4 bytes
+            u_mb    = u_bytes / 2**20
+            print(f"[Model] Initialized: N={self.N} assessors, n={self.n} items, "
+                  f"C={self.C} clusters, n_pairs={n_pairs:,}")
             if self._gpu is not None:
-                print(f"[Model] GPU acceleration: {_torch.cuda.get_device_name(0)} "
-                      f"({_torch.cuda.get_device_properties(0).total_memory // 2**20} MB VRAM)")
+                dev_name = _torch.cuda.get_device_name(0)
+                vram_mb  = _torch.cuda.get_device_properties(0).total_memory // 2**20
+                print(f"[Model] Compute:  GPU — {dev_name} ({vram_mb:,} MB VRAM)")
+                print(f"[Model] U_all:    {self.N}×{n_pairs:,}  ({u_mb:.1f} MB float32, on GPU)")
             else:
-                _reason = ("disabled" if not _TORCH_AVAILABLE else
-                           "no CUDA device" if not _torch.cuda.is_available() else "unknown")
-                print(f"[Model] GPU acceleration: unavailable ({_reason})")
-            print(f"[Model] Parallelization threshold: N >= {self.parallel_threshold_n if self.parallel_threshold_n != float('inf') else 'disabled'}")
-            from .distance import _USE_NUMBA as _dist_numba
-            print(f"[Model] Numba JIT (distance): {'enabled' if _dist_numba else 'disabled'}")
+                if not _TORCH_AVAILABLE:
+                    _reason = "torch not installed"
+                elif not _torch.cuda.is_available():
+                    _reason = "no CUDA device found"
+                else:
+                    _reason = "unknown"
+                print(f"[Model] Compute:  CPU  (GPU unavailable — {_reason})")
+                print(f"[Model] U_all:    {self.N}×{n_pairs:,}  ({u_mb:.1f} MB float32, on CPU)")
+            print(f"[Model] Parallel: N threshold = "
+                  f"{self.parallel_threshold_n if self.parallel_threshold_n != float('inf') else 'disabled'}")
             for c, cl in enumerate(self.state.clusters):
                 K = len(cl.blocks)
                 print(f"  Cluster {c}: {K} blocks, theta={cl.theta:.3f}, gamma={cl.gamma:.3f}, delta={cl.delta:.3f}")
