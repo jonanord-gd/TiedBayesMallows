@@ -144,20 +144,17 @@ def bradley_terry_mle(
     """
     n = s.shape[0]
     lam = np.ones(n)
+    W = s.sum(axis=1)                # W[i] = wins of item i
+    n_ij_mat = s + s.T               # n_ij_mat[i,j] = total comparisons between i and j
 
     for _ in range(max_iter):
         lam_old = lam.copy()
-        for i in range(n):
-            W_i = s[i].sum()
-            denom = 0.0
-            for j in range(n):
-                if j == i:
-                    continue
-                n_ij = s[i, j] + s[j, i]
-                if n_ij > 0:
-                    denom += n_ij / (lam[i] + lam[j])
-            if denom > 0:
-                lam[i] = W_i / denom
+        # denom[i] = sum_{j} n_ij_mat[i,j] / (lam[i] + lam[j])
+        # diagonal is 0 (n_ij_mat[i,i] = 0) so no masking needed
+        lam_sum = lam[:, None] + lam[None, :]  # (n, n)
+        denom = (n_ij_mat / lam_sum).sum(axis=1)  # (n,)
+        mask = denom > 0
+        lam[mask] = W[mask] / denom[mask]
         # normalise
         lam *= n / lam.sum()
         if np.max(np.abs(lam - lam_old)) < tol:
@@ -170,14 +167,8 @@ def bt_alpha(lam: np.ndarray) -> np.ndarray:
     Convert BT parameters to pairwise probabilities.
     alpha[i,j] = P(i > j | T_ij=0) = lambda_i / (lambda_i + lambda_j).
     """
-    n = len(lam)
-    alpha = np.zeros((n, n))
-    for i in range(n):
-        for j in range(n):
-            if i == j:
-                alpha[i, j] = 0.5
-            else:
-                alpha[i, j] = lam[i] / (lam[i] + lam[j])
+    alpha = lam[:, None] / (lam[:, None] + lam[None, :])
+    np.fill_diagonal(alpha, 0.5)
     return alpha
 
 
@@ -397,13 +388,26 @@ def misclassification_loss(
     Smooth misclassification loss (eq. 26):
         L(p) = sum_{i<j} (1{p < w_ij} - q_ij)^2
     """
-    n = q.shape[0]
-    loss = 0.0
-    for i in range(n):
-        for j in range(i + 1, n):
-            indicator = 1.0 if p < w[i, j] else 0.0
-            loss += (indicator - q[i, j]) ** 2
-    return loss
+    i_idx, j_idx = np.triu_indices(q.shape[0], k=1)
+    indicator = (p < w[i_idx, j_idx]).astype(float)
+    return float(np.sum((indicator - q[i_idx, j_idx]) ** 2))
+
+
+def _misclassification_loss_grid(
+    p_grid: np.ndarray,
+    q: np.ndarray,
+    w: np.ndarray,
+) -> np.ndarray:
+    """
+    Vectorised evaluation of misclassification_loss over an entire grid.
+    Returns an array of losses, one per p value.
+    """
+    i_idx, j_idx = np.triu_indices(q.shape[0], k=1)
+    w_pairs = w[i_idx, j_idx]          # (n_pairs,)
+    q_pairs = q[i_idx, j_idx]          # (n_pairs,)
+    # indicators shape: (grid_size, n_pairs)
+    indicators = (p_grid[:, None] < w_pairs[None, :]).astype(float)
+    return np.sum((indicators - q_pairs[None, :]) ** 2, axis=1)
 
 
 def estimate_p_data_informed(
@@ -473,9 +477,9 @@ def estimate_p_data_informed(
     # Empirical tie weights
     w = empirical_tie_weight(s, N)
 
-    # Grid search for p_hat
+    # Grid search for p_hat (fully vectorised over the grid)
     p_grid = np.linspace(1e-6, 0.5 - 1e-6, grid_size)
-    losses = np.array([misclassification_loss(p, q, w) for p in p_grid])
+    losses = _misclassification_loss_grid(p_grid, q, w)
     best_idx = np.argmin(losses)
     p_hat = float(p_grid[best_idx])
 
