@@ -2,4 +2,20 @@
 __pycache__/
 *.pyc
 *.pyo
+
+# Data files
 *.csv
+*.pkl
+*.soi
+
+# Model run outputs
+**/runs/
+
+# Downloaded / generated data directories
+f1_data/raw/
+f1_data/rankings/
+f1_data/matrices/
+movielens/ml-*/
+sport_power/baseball/
+sport_power/basketball/
+sport_power/football/

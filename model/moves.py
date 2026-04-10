@@ -151,6 +151,22 @@ def compute_all_disagreements_fast(
 
 # ── Gibbs candidate building ──────────────────────────────────
 
+def build_pair_cache(n: int) -> np.ndarray:
+    """Precompute flat pair indices for each item l.
+
+    Returns ndarray of shape ``(n, n-1)`` where ``cache[l]`` holds the
+    pair indices for all other items in the order ``[0..l-1, l+1..n-1]``.
+    """
+    items = np.arange(n)
+    cache = np.empty((n, n - 1), dtype=np.intp)
+    for l in range(n):
+        xs = np.concatenate([items[:l], items[l + 1:]])
+        a = np.minimum(l, xs)
+        b = np.maximum(l, xs)
+        cache[l] = a * (2 * n - a - 1) // 2 + (b - a - 1)
+    return cache
+
+
 def _build_base(
     blocks: List[List[int]], block_l: int, elem_idx: int
 ) -> List[List[int]]:
@@ -197,11 +213,14 @@ def fast_gibbs_reassign_one_item(
     include_uniform_order_prior: bool = True,
     rng: Optional[random.Random] = None,
     tie_penalty: float = 0.5,
-) -> Tuple[List[List[int]], int, int]:
+    log_qfact: Optional[List[float]] = None,
+    block_index: Optional[List[int]] = None,
+    pair_cache: Optional[np.ndarray] = None,
+) -> Tuple[List[List[int]], int, int, int]:
     """Gibbs-sample a new block assignment for one randomly chosen item.
 
-    Return signature ``(new_blocks, n_proposals, n_accepts)`` matches the old
-    ``gibbs_reassign_one_item`` but runs in O(n + K) per call vs O(2K · N n log K).
+    Return signature ``(new_blocks, n_proposals, n_accepts, moved_item)``.
+    Runs in O(n + K) per call vs O(2K · N n log K) for the old version.
 
     Parameters
     ----------
@@ -209,15 +228,30 @@ def fast_gibbs_reassign_one_item(
         Precomputed cluster-level pairwise preferences, shape ``(comb(n, 2),)``.
         ``H[pair_index(a, b)] = #{assessors in cluster: r[a] > r[b]}``.
         If *None*, derived from *U_all* + *cluster_mask* or computed from scratch.
+    log_qfact : list of float, optional
+        Precomputed ``build_log_qfactorials(n, exp(-theta))``.
+        Pass this when calling in a loop with fixed theta to avoid recomputing.
+    block_index : list of int, optional
+        Item → block mapping for *blocks*.  Avoids redundant
+        ``blocks_to_block_index`` calls when the caller already has it.
+    pair_cache : ndarray, shape (n, n-1), optional
+        Precomputed flat pair indices for each item (from ``build_pair_cache``).
     """
     if rng is None:
         rng = random.Random()
     if not rankings:
-        return [b[:] for b in blocks], 0, 0
+        return [b[:] for b in blocks], 0, 0, -1
 
     N = len(rankings)
     n = len(rankings[0])
 
+    # ── Step 1: resolve H (cluster-level pairwise preference counts) ──────────
+    # H[pair_index(a, b)] = number of assessors in this cluster for whom item a
+    # is ranked *after* item b (i.e. position_of(a) > position_of(b)).
+    # Three resolution paths, from cheapest to most expensive:
+    #   (a) caller supplied H directly → use as-is
+    #   (b) U_all (full N×pairs matrix) + boolean cluster_mask → row-sum subset
+    #   (c) neither available → recompute U_all from scratch and sum all rows
     if H is None:
         if U_all is not None and cluster_mask is not None:
             H = U_all[cluster_mask].sum(axis=0)
@@ -225,14 +259,21 @@ def fast_gibbs_reassign_one_item(
             U = compute_U_all(rankings, n)
             H = U.sum(axis=0)
 
-    l = rng.randrange(n)
-    block_index = blocks_to_block_index(blocks, n)
-    block_l = block_index[l]
-    elem_idx = blocks[block_l].index(l)
+    # ── Step 2: pick the item to reassign ─────────────────────────────────────
+    l = rng.randrange(n)                      # item l is selected uniformly at random
+    if block_index is None:
+        block_index = blocks_to_block_index(blocks, n, validate=False)
+    block_l = block_index[l]                  # which block l currently sits in
+    elem_idx = blocks[block_l].index(l)       # position of l within that block
 
+    # ── Step 3: build the "base" structure (blocks minus item l) ──────────────
+    # base is the block partition after removing l (empty blocks are dropped).
+    # K_minus is the number of blocks that remain.
     base = _build_base(blocks, block_l, elem_idx)
     K_minus = len(base)
 
+    # Block sizes and a per-item block-index array for the base structure.
+    # base_block_idx[l] is set to -1 as a sentinel (l is unplaced).
     base_sizes = [len(b) for b in base]
     base_block_idx = np.empty(n, dtype=np.intp)
     base_block_idx[l] = -1
@@ -240,21 +281,40 @@ def fast_gibbs_reassign_one_item(
         for item in blk:
             base_block_idx[item] = k
 
-    items = np.arange(n)
-    xs = items[items != l]
-    a_arr = np.minimum(l, xs)
-    b_arr = np.maximum(l, xs)
-    pidx_arr = a_arr * (2 * n - a_arr - 1) // 2 + (b_arr - a_arr - 1)
+    # ── Step 4: compute per-pair preference counts involving l ────────────────
+    # For every other item x we need h_l_gt_x = #{assessors: pos(l) > pos(x)},
+    # i.e. the number of times l is ranked *after* x.
+    # H stores counts for pairs (a, b) with a < b as "#{pos(a) > pos(b)}".
+    # When l < x the stored value is already h_l_gt_x.
+    # When l > x the stored value is h_x_gt_l = N - h_l_gt_x, so we flip.
+    if pair_cache is not None:
+        pidx_arr = pair_cache[l]
+    else:
+        items = np.arange(n)
+        xs = items[items != l]
+        a_arr = np.minimum(l, xs)
+        b_arr = np.maximum(l, xs)
+        pidx_arr = a_arr * (2 * n - a_arr - 1) // 2 + (b_arr - a_arr - 1)
 
-    h_vals = H[pidx_arr].copy()
-    flip_mask = l > xs
-    h_vals[flip_mask] = N - h_vals[flip_mask]
+    h_vals = H[pidx_arr].copy()               # raw counts from H for each pair (l, x)
+    if l > 0:
+        h_vals[:l] = N - h_vals[:l]           # flip pairs where l is the larger index
 
-    block_ids = base_block_idx[xs]
+    # ── Step 5: aggregate h_vals by block using prefix/suffix arrays ──────────
+    # H_gt_block[k] = sum of h_vals for items x residing in base-block k.
+    # This is the total "l is ranked after x" signal contributed by block k.
+    # H_lt_block[k] = N * |block k| - H_gt_block[k], the complementary count.
+    # base_block_idx maps each item to its block in the base structure;
+    # we need indices for all items except l, i.e. [0..l-1, l+1..n-1].
+    block_ids = np.delete(base_block_idx, l)
     H_gt_block = np.zeros(K_minus)
     np.add.at(H_gt_block, block_ids, h_vals)
     H_lt_block = N * np.array(base_sizes, dtype=float) - H_gt_block
 
+    # prefix_Hlt[p]  = sum of H_lt_block[0..p-1]  (blocks strictly before p)
+    # suffix_Hgt[p]  = sum of H_gt_block[p..K_minus-1]  (blocks at p or after)
+    # Together they let us evaluate the distance contribution for any candidate
+    # placement of l in O(1) using: contrib_l = prefix_Hlt[p] + suffix_Hgt[p].
     prefix_Hlt = np.empty(K_minus + 1)
     prefix_Hlt[0] = 0.0
     np.cumsum(H_lt_block, out=prefix_Hlt[1:])
@@ -263,40 +323,43 @@ def fast_gibbs_reassign_one_item(
     np.cumsum(H_gt_block[::-1], out=suffix_Hgt[:K_minus])
     suffix_Hgt[:K_minus] = suffix_Hgt[:K_minus][::-1]
 
+    # ── Step 6: precompute terms that are shared across all candidates ─────────
     q = math.exp(-theta)
-    log_qfact = build_log_qfactorials(n, q)
-    log_gamma_1md = lgamma(1.0 - delta)
+    if log_qfact is None:
+        log_qfact = build_log_qfactorials(n, q)
+    log_gamma_1md = lgamma(1.0 - delta)       # log Γ(1−δ), used in Pitman-Yor size factor
+    # Denominator of the Pitman-Yor (PY) table prior: log[Γ(γ+n)/Γ(γ+1)]
     log_py_denom = lgamma(gamma + n) - lgamma(gamma + 1)
 
-    log_py_tables_base = 0.0
-    for i in range(1, K_minus):
-        log_py_tables_base += log(gamma + i * delta)
+    # PY table-count factor for the base K_minus blocks:
+    log_py_tables_base = sum(log(gamma + i * delta) for i in range(1, K_minus))
+    # PY block-size factor:
+    log_py_sizes_base = sum(lgamma(s - delta) - log_gamma_1md for s in base_sizes)
 
-    log_py_sizes_base = 0.0
-    for s in base_sizes:
-        log_py_sizes_base += lgamma(s - delta) - log_gamma_1md
-
+    # Mallows normalisation base terms:
     base_Tm = sum(s * (s - 1) // 2 for s in base_sizes)
     base_logP = sum(lgamma(s + 1) for s in base_sizes)
     base_log_qf_sum = sum(log_qfact[s] for s in base_sizes)
 
+    # ── Step 7: "create" candidate log-weights ────────────────────────────────
+    # There are K_minus+1 positions where l can be inserted as a new singleton.
     log_py_create = (log_py_tables_base + log(gamma + K_minus * delta)
                      + log_py_sizes_base - log_py_denom)
     log_Z_create = (-theta * tie_penalty * base_Tm + base_logP
                     + log_qfact[n] - base_log_qf_sum - log_qfact[1])
     log_ord_create = -lgamma(K_minus + 2) if include_uniform_order_prior else 0.0
 
+    lw_create_common = log_py_create + log_ord_create - N * log_Z_create
+    log_weights: List[float] = []
+    for p in range(K_minus + 1):
+        log_weights.append(lw_create_common - theta * (prefix_Hlt[p] + suffix_Hgt[p]))
+
+    # ── Step 8: "add" candidate log-weights ───────────────────────────────────
+    # There are K_minus candidates, one for each existing block l can join.
     log_py_add_common = log_py_tables_base + log_py_sizes_base - log_py_denom
     log_Z_add_base = (-theta * tie_penalty * base_Tm + base_logP
                       + log_qfact[n] - base_log_qf_sum)
     log_ord_add = -lgamma(K_minus + 1) if include_uniform_order_prior else 0.0
-
-    log_weights: List[float] = []
-
-    lw_create_common = log_py_create + log_ord_create - N * log_Z_create
-    for p in range(K_minus + 1):
-        contrib_l = prefix_Hlt[p] + suffix_Hgt[p]
-        log_weights.append(lw_create_common - theta * contrib_l)
 
     for k in range(K_minus):
         s_k = base_sizes[k]
@@ -306,9 +369,11 @@ def fast_gibbs_reassign_one_item(
                    + log(s_k + 1) - (log_qfact[s_k + 1] - log_qfact[s_k]))
         log_weights.append(log_py_k + log_ord_add - theta * contrib_l - N * log_Z_k)
 
+    # ── Step 9: sample from the categorical distribution ──────────────────────
     idx = sample_categorical_from_logweights(log_weights, rng)
+
     chosen = _build_candidate(base, l, idx, K_minus)
-    return chosen, 1, 1
+    return chosen, 1, 1, l
 
 
 # ── greedy (ICM) variant ─────────────────────────────────────

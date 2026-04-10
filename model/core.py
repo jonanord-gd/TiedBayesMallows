@@ -32,11 +32,19 @@ from .profiling import get_profiler
 from .moves import (
     compute_U_all,
     build_cluster_pair_masks,
+    build_pair_cache,
     compute_all_disagreements_fast,
     fast_gibbs_reassign_one_item,
     icm_sweep_cluster,
 )
 from .priors import build_log_qfactorials
+from .augmentation import (
+    PartialRankingInfo,
+    detect_missing,
+    complete_rankings,
+    update_U_rows,
+    augmentation_mh_step,
+)
 
 # Optional PyTorch GPU support — gracefully absent if not installed
 try:
@@ -60,6 +68,7 @@ class MixtureRankingModel:
         self,
         rankings: List[List[int]],
         *,
+        n_items: Optional[int] = None,
         init_clusters: Optional[List[ClusterParams]] = None,
         n_clusters: Optional[int] = None,
         init_mu: Optional[List[float]] = None,
@@ -139,13 +148,31 @@ class MixtureRankingModel:
         """
         if len(rankings) == 0:
             raise ValueError("rankings must be non-empty")
-        self.rankings = rankings
         self.N = len(rankings)
-        self.n = len(rankings[0])
-        if any(len(r) != self.n for r in rankings):
-            raise ValueError("All rankings must have same length")
+
+        # Determine n (total items).  With partial rankings the lists may
+        # differ in length, so the caller can pass n_items explicitly.
+        if n_items is not None:
+            self.n = n_items
+        else:
+            self.n = len(rankings[0])
+            if any(len(r) != self.n for r in rankings):
+                raise ValueError(
+                    "Rankings have different lengths.  When passing partial "
+                    "rankings, set n_items to the total number of items."
+                )
 
         self.rng = random.Random(seed)
+
+        # ── Partial-ranking detection & completion ────────────────────────
+        self._partial_info: PartialRankingInfo = detect_missing(rankings, self.n)
+        if self._partial_info.has_missing:
+            # Store the original (observed) rankings and create completed copies
+            self._original_rankings = [list(r) for r in rankings]
+            self.rankings = complete_rankings(rankings, self._partial_info, self.n, self.rng)
+        else:
+            self._original_rankings = None
+            self.rankings = rankings
 
         # Auto-generate clusters if not provided
         if init_clusters is None:
@@ -226,7 +253,9 @@ class MixtureRankingModel:
 
         # Precompute per-assessor pairwise preference matrix (O(N n^2), done once).
         # Stored as float32: exact for 0/1 values, avoids per-iteration cast in matmul.
-        self._U_all = compute_U_all(rankings, self.n).astype(np.float32)
+        # Uses self.rankings (which are completed if partial data was detected).
+        self._U_all = compute_U_all(self.rankings, self.n).astype(np.float32)
+        self._pair_cache = build_pair_cache(self.n)  # (n, n-1) pair indices
 
         # Precompute initial M / offsets for all clusters (cached across iterations)
         block_idx_list = [self._cache[c].block_idx for c in range(self.C)]
@@ -235,6 +264,18 @@ class MixtureRankingModel:
         self._M_f32_T: np.ndarray = np.ascontiguousarray(self._M.T, dtype=np.float32)
         self._M_dirty = [False] * self.C
         self._triu_indices = np.triu_indices(self.n, k=1)  # reused every rebuild
+
+        # D_cache: (N, C) disagreement matrix maintained incrementally.
+        # Initialised to None; the first call to _compute_all_disagreements()
+        # does a full matmul and populates this.  Subsequent iterations use
+        # sparse O(N·n) updates per block change (see _apply_incremental_D_update).
+        self._D_cache: Optional[np.ndarray] = None
+
+        # H_cache: (C, n_pairs) array — per-cluster pairwise preference sums
+        # H_cache[c] = U_all[z==c].sum(0).  Maintained incrementally via
+        # vectorised matmul after z updates.  Initialised to None; built from
+        # scratch on the first z-update.
+        self._H_cache: Optional[np.ndarray] = None
 
         # ── GPU acceleration ──────────────────────────────────────────────────
         # When a CUDA device is found, U_all and M are stored exclusively on GPU.
@@ -259,7 +300,15 @@ class MixtureRankingModel:
 
         # Sampler config
         self.cfg = SamplerConfig()
-        
+
+        # ── Collapsed-cluster tracking ────────────────────────────────────────────
+        # A cluster is marked permanently dead after COLLAPSE_PATIENCE consecutive
+        # iterations with 0 assessors.  Dead clusters are excluded from all future
+        # z-assignments and parameter updates, saving wasted computation.
+        self.COLLAPSE_PATIENCE: int = 20   # tuneable; set to 0 to disable
+        self._zero_streak: List[int] = [0] * self.C   # consecutive-empty counter
+        self._dead_clusters: set = set()               # permanently collapsed
+
         # Parallelization threshold: disable by default to avoid overhead
         # For large problems (N > 300), set this to enable parallelization
         self.parallel_threshold_n = parallel_threshold_n if parallel_threshold_n is not None else float('inf')
@@ -288,6 +337,13 @@ class MixtureRankingModel:
                 print(f"[Model] U_all:    {self.N}×{n_pairs:,}  ({u_mb:.1f} MB float32, on CPU)")
             print(f"[Model] Parallel: N threshold = "
                   f"{self.parallel_threshold_n if self.parallel_threshold_n != float('inf') else 'disabled'}")
+            if self._partial_info.has_missing:
+                print(f"[Model] Partial rankings: {self._partial_info.n_partial}/{self.N} "
+                      f"assessors have missing items")
+                miss_counts = [len(m) for m in self._partial_info.missing_items if m]
+                print(f"[Model]   Missing items per assessor: "
+                      f"min={min(miss_counts)}, max={max(miss_counts)}, "
+                      f"mean={sum(miss_counts)/len(miss_counts):.1f}")
             for c, cl in enumerate(self.state.clusters):
                 K = len(cl.blocks)
                 print(f"  Cluster {c}: {K} blocks, theta={cl.theta:.3f}, gamma={cl.gamma:.3f}, delta={cl.delta:.3f}")
@@ -339,20 +395,26 @@ class MixtureRankingModel:
     # -----------------------
     
     def _compute_all_disagreements(self) -> np.ndarray:
-        """Compute disagreements[i][c] for all assessors × clusters via matmul.
+        """Compute disagreements[i][c] for all assessors × clusters.
 
-        Uses precomputed U_all and cached M/offsets.  Only rebuilds M rows
-        for clusters whose blocks changed (flagged dirty by
-        ``_rebuild_cluster_cache``).
+        **Fast path** (typical after iteration 1): if ``_D_cache`` is valid
+        and no clusters are dirty, returns the cached matrix in O(1).
+        The cache is maintained by ``_apply_incremental_D_update`` which
+        performs O(N·n) sparse updates per block change instead of the
+        O(N·C·n²) full matmul.
 
-        The result is also stored in ``self._D_cache`` for reuse by
-        ``_update_cluster_theta``.
+        **Slow path** (first call, or after U_all invalidation): full matmul
+        ``U_all @ M.T + offsets``.  Sets ``_D_cache`` for future re-use.
 
         Returns ndarray of shape (N, C).
         """
+        # ── fast path: D_cache already up-to-date ─────────────────────────
+        if self._D_cache is not None and not any(self._M_dirty):
+            return self._D_cache
+
+        # ── slow path: full matmul rebuild ────────────────────────────────
         a_idx, b_idx = self._triu_indices
 
-        any_dirty = False
         for c in range(self.C):
             if self._M_dirty[c]:
                 bidx_arr = np.asarray(self._cache[c].block_idx, dtype=np.intp)
@@ -360,15 +422,14 @@ class MixtureRankingModel:
                 self._M[c] = np.sign(-diff)
                 self._offsets[c] = np.count_nonzero(diff > 0)
                 self._M_dirty[c] = False
-                any_dirty = True
-        if any_dirty:
-            # Rebuild the cached contiguous float32 transpose used by the matmul
-            np.copyto(self._M_f32_T, self._M.T)
-            if self._gpu is not None:
-                # Push updated M and offsets to GPU
-                self._M_t.copy_(_torch.from_numpy(self._M_f32_T))
-                self._offsets_t.copy_(_torch.from_numpy(
-                    self._offsets.astype(np.float32)))
+
+        # Always rebuild the transpose — M may have been modified by
+        # incremental updates that didn't touch _M_f32_T.
+        np.copyto(self._M_f32_T, self._M.T)
+        if self._gpu is not None:
+            self._M_t.copy_(_torch.from_numpy(self._M_f32_T))
+            self._offsets_t.copy_(_torch.from_numpy(
+                self._offsets.astype(np.float32)))
 
         if self._gpu is not None:
             D_t = _torch.mm(self._U_all_t, self._M_t)
@@ -378,6 +439,65 @@ class MixtureRankingModel:
         self._D_cache = D
         return D
 
+    def _apply_incremental_D_update(
+        self, c: int, moved_item: int,
+        old_block_idx, new_block_idx,
+    ) -> None:
+        """Incrementally update ``D_cache[:, c]`` and ``M[c]`` after one item moved.
+
+        Only the n−1 pairs involving *moved_item* can change their M sign.
+        Cost: O(N · n_changed) where n_changed ≤ n−1.  Compare to the full
+        matmul at O(N · C · n²).
+        """
+        n = self.n
+        l = moved_item
+
+        # Pair indices for all (l, x) pairs
+        xs = np.arange(n)
+        xs = xs[xs != l]
+        a_arr = np.minimum(l, xs)
+        b_arr = np.maximum(l, xs)
+        pidx_arr = (a_arr * (2 * n - a_arr - 1) // 2 + (b_arr - a_arr - 1)).astype(np.intp)
+
+        # Old signs from current M[c] (still reflects pre-move state)
+        old_signs = self._M[c, pidx_arr].copy()
+
+        # New signs from new block_idx
+        new_bi = np.asarray(new_block_idx, dtype=np.intp)
+        new_signs = np.sign(new_bi[b_arr] - new_bi[a_arr]).astype(np.float64)
+
+        # Only process pairs whose sign actually changed
+        changed_mask = old_signs != new_signs
+        if not changed_mask.any():
+            return
+
+        changed_pidx = pidx_arr[changed_mask]
+        old_ch = old_signs[changed_mask]
+        new_ch = new_signs[changed_mask]
+        delta = (new_ch - old_ch).astype(np.float32)
+
+        # Update M[c] in-place
+        self._M[c, changed_pidx] = new_ch
+
+        # Update offset[c]
+        offset_delta = float((new_ch == -1.0).sum() - (old_ch == -1.0).sum())
+        self._offsets[c] += offset_delta
+
+        # Sparse D update:  D[:, c] += U_all[:, changed] @ delta + offset_delta
+        if self._gpu is not None:
+            pidx_t = _torch.from_numpy(changed_pidx.copy()).to(
+                self._gpu, dtype=_torch.long)
+            delta_t = _torch.from_numpy(delta.copy()).to(self._gpu)
+            update = _torch.mv(self._U_all_t[:, pidx_t], delta_t)
+            self._D_cache[:, c] += (
+                update.cpu().numpy().astype(np.float64) + offset_delta
+            )
+        else:
+            U_sub = self._U_all[:, changed_pidx]   # (N, n_changed) float32
+            self._D_cache[:, c] += (
+                (U_sub @ delta).astype(np.float64) + offset_delta
+            )
+
     def _update_z(self) -> None:
         """Update cluster assignments using matmul-based disagreements.
 
@@ -385,6 +505,10 @@ class MixtureRankingModel:
         via ``_compute_all_disagreements`` (which uses precomputed U_all).
         Log-weights are built with vectorised numpy, and sampling uses the
         Gumbel-max trick for a single vectorised draw.
+
+        After z changes, the per-cluster H_cache is updated incrementally:
+        only rows that changed cluster have their U row subtracted from the
+        old cluster's H and added to the new cluster's H.
         """
         state = self.state
         C = self.C
@@ -419,6 +543,15 @@ class MixtureRankingModel:
                       - thetas[np.newaxis, :] * (D + tie_penalty * Tms[np.newaxis, :])
                       - logZ[np.newaxis, :])
 
+        # Zero out dead clusters: force log-weight to -inf so they can never
+        # receive an assignment, making the collapse permanent.
+        if self._dead_clusters:
+            dead_arr = list(self._dead_clusters)
+            logweights[:, dead_arr] = -np.inf
+
+        # Save old z for incremental H update
+        old_z = state.z.copy()
+
         # Gumbel-max trick: sample all N assignments in one vectorised op
         gumbels = -np.log(-np.log(
             np.random.default_rng(self.rng.randint(0, 2**31)).random((self.N, C))
@@ -426,6 +559,90 @@ class MixtureRankingModel:
         z_new = np.argmax(logweights + gumbels, axis=1)
         # Keep as ndarray — avoids .tolist() here and np.array() in every cluster_mask
         state.z = z_new
+
+        # ── Incremental H_cache update ────────────────────────────────────
+        self._update_H_cache_after_z_change(old_z, z_new)
+
+    def _update_H_cache_after_z_change(
+        self, old_z: np.ndarray, new_z: np.ndarray
+    ) -> None:
+        """Incrementally update H_cache after z assignments changed.
+
+        If H_cache doesn't exist yet (first iteration), builds from scratch
+        via a single indicator-matrix matmul:  H = Ind.T @ U_all.
+
+        Otherwise, builds a (k, C) delta matrix with -1 at old cluster and
+        +1 at new cluster for each changed assessor, then computes the
+        update in one BLAS matmul:  H += delta.T @ U_changed.
+
+        Both paths are loop-free and use multi-threaded BLAS.
+        """
+        C = self.C
+        N = self.N
+
+        if self._H_cache is None:
+            # First time: build from scratch via indicator matmul
+            # indicators: (N, C) one-hot, U_all: (N, n_pairs)
+            # H = indicators.T @ U_all → (C, n_pairs)
+            indicators = np.zeros((N, C), dtype=np.float32)
+            indicators[np.arange(N), new_z] = 1.0
+            if self._gpu is not None:
+                ind_t = _torch.from_numpy(indicators).to(self._gpu)
+                self._H_cache = (
+                    (ind_t.T @ self._U_all_t)
+                    .cpu().numpy().astype(np.float64)
+                )
+            else:
+                self._H_cache = (indicators.T @ self._U_all).astype(
+                    np.float64
+                )
+            return
+
+        # Incremental path: find assessors that changed cluster
+        changed_mask = old_z != new_z
+        if not changed_mask.any():
+            return
+
+        changed_idx = np.where(changed_mask)[0]
+        old_c = old_z[changed_idx]
+        new_c = new_z[changed_idx]
+        k = len(changed_idx)
+
+        if self._gpu is not None:
+            # delta: (k, C) with -1 at old cluster, +1 at new cluster
+            delta = np.zeros((k, C), dtype=np.float32)
+            delta[np.arange(k), old_c] = -1.0
+            delta[np.arange(k), new_c] = 1.0
+
+            idx_t = _torch.from_numpy(changed_idx.copy()).to(
+                self._gpu, dtype=_torch.long
+            )
+            delta_t = _torch.from_numpy(delta).to(self._gpu)
+            U_changed = self._U_all_t[idx_t]  # (k, n_pairs)
+            # (C, k) @ (k, n_pairs) → (C, n_pairs)
+            self._H_cache += (
+                (delta_t.T @ U_changed)
+                .cpu().numpy().astype(np.float64)
+            )
+        elif k <= 128:
+            # Small k: per-cluster accumulation avoids creating a large
+            # (k, n_pairs) temporary and the delta matrix entirely.
+            U = self._U_all
+            H = self._H_cache
+            for c in range(C):
+                leaving = changed_idx[old_c == c]
+                if len(leaving) > 0:
+                    H[c] -= U[leaving].sum(axis=0)
+                joining = changed_idx[new_c == c]
+                if len(joining) > 0:
+                    H[c] += U[joining].sum(axis=0)
+        else:
+            # Large k: single BLAS matmul is more efficient.
+            delta = np.zeros((k, C), dtype=np.float32)
+            delta[np.arange(k), old_c] = -1.0
+            delta[np.arange(k), new_c] = 1.0
+            U_changed = self._U_all[changed_idx]  # (k, n_pairs) float32
+            self._H_cache += (delta.T @ U_changed).astype(np.float64)
 
     def _update_tau(self) -> None:
         # Cache self references to eliminate attribute lookup overhead
@@ -437,6 +654,25 @@ class MixtureRankingModel:
         counts = np.bincount(state.z, minlength=C)
         post = [init_mu[c] + int(counts[c]) for c in range(C)]
         state.tau = dirichlet_sample(post, rng)
+
+        # ── Collapse detection ────────────────────────────────────────────────
+        # Update zero-streak counters; permanently retire clusters that have
+        # been empty for COLLAPSE_PATIENCE consecutive iterations.
+        if self.COLLAPSE_PATIENCE > 0:
+            newly_dead: List[int] = []
+            for c in range(C):
+                if c in self._dead_clusters:
+                    continue
+                if counts[c] == 0:
+                    self._zero_streak[c] += 1
+                    if self._zero_streak[c] >= self.COLLAPSE_PATIENCE:
+                        self._dead_clusters.add(c)
+                        newly_dead.append(c)
+                else:
+                    self._zero_streak[c] = 0
+            if newly_dead and self.verbose:
+                print(f"[Model] Clusters permanently retired (collapsed): {newly_dead}  "
+                      f"(total dead: {len(self._dead_clusters)}/{C})")
 
     def _cluster_rankings(self, c: int) -> List[List[int]]:
         # Cache self references
@@ -535,12 +771,24 @@ class MixtureRankingModel:
         proposals = 0
         accepts = 0
 
-        cluster_mask = state.z == c
-        _fast_H = self._U_row_sum(cluster_mask)
+        # Use cached H if available (maintained incrementally after z updates),
+        # otherwise fall back to full sum.
+        if self._H_cache is not None:
+            _fast_H = self._H_cache[c]
+        else:
+            cluster_mask = state.z == c
+            _fast_H = self._U_row_sum(cluster_mask)
+
+        # Track block_idx for incremental D updates between moves
+        current_block_idx = self._cache[c].block_idx
+
+        # Precompute values constant across the n_item_moves loop:
+        _log_qfact = build_log_qfactorials(self.n, math.exp(-cl_theta))
+        _pair_cache = self._pair_cache
 
         for _ in range(n_item_moves):
             t_move_start = time.time()
-            out_blocks, p, a = fast_gibbs_reassign_one_item(
+            out_blocks, p, a, moved_item = fast_gibbs_reassign_one_item(
                 rankings=rankings_c,
                 blocks=cl_blocks,
                 theta=cl_theta,
@@ -549,8 +797,24 @@ class MixtureRankingModel:
                 H=_fast_H,
                 rng=rng,
                 tie_penalty=cfg.tie_penalty,
+                log_qfact=_log_qfact,
+                block_index=current_block_idx,
+                pair_cache=_pair_cache,
             )
             t_move_elapsed = time.time() - t_move_start
+
+            # Incremental D update: O(N·n) instead of full O(N·C·n²) matmul
+            if self._D_cache is not None and moved_item >= 0:
+                new_block_idx = blocks_to_block_index(
+                    out_blocks, self.n, validate=False)
+                self._apply_incremental_D_update(
+                    c, moved_item, current_block_idx, new_block_idx)
+                current_block_idx = new_block_idx
+            else:
+                # Blocks may have changed even when D_cache is None;
+                # recompute block_index for the next iteration.
+                current_block_idx = blocks_to_block_index(
+                    out_blocks, self.n, validate=False)
 
             if profiler is not None:
                 profiler.record_move("gibbs_reassign", t_move_elapsed, accepted=False, proposals=p or 1, accepts=a or 0)
@@ -562,8 +826,54 @@ class MixtureRankingModel:
         cl.blocks = cl_blocks
         after_key = _canonicalize_blocks(cl_blocks)
         self._rebuild_cluster_cache(c)
+        # M[c] was already updated incrementally — clear the dirty flag
+        # that _rebuild_cluster_cache sets.
+        if self._D_cache is not None:
+            self._M_dirty[c] = False
 
         return proposals, accepts, (before_key != after_key)
+
+    def _update_augmented_rankings(self) -> Tuple[int, int]:
+        """MH augmentation step for partial rankings.
+
+        For each assessor with missing items, propose swapping two unranked
+        items and accept/reject based on the Mallows likelihood under the
+        assessor's current cluster.  Accepted swaps modify
+        ``self.rankings`` in-place and the corresponding U_all rows are
+        recomputed.
+
+        Returns ``(n_proposals, n_accepts)``.
+        """
+        if not self._partial_info.has_missing:
+            return 0, 0
+
+        n_prop, n_acc = augmentation_mh_step(
+            rankings=self.rankings,
+            info=self._partial_info,
+            z=self.state.z,
+            clusters=self.state.clusters,
+            cache=self._cache,
+            tie_penalty=self.cfg.tie_penalty,
+            rng=self.rng,
+            n=self.n,
+        )
+
+        if n_acc > 0:
+            # Recompute U_all rows for assessors that were modified
+            changed_idx = np.where(self._partial_info.partial_mask)[0]
+            if self._gpu is not None:
+                # CPU-side U_all was freed; work on a temporary then push to GPU
+                U_cpu = self._U_all_t.cpu().numpy()
+                update_U_rows(U_cpu, self.rankings, changed_idx, self.n)
+                self._U_all_t.copy_(_torch.from_numpy(U_cpu))
+            else:
+                update_U_rows(self._U_all, self.rankings, changed_idx, self.n)
+
+            # U_all changed → D_cache and H_cache are stale
+            self._D_cache = None
+            self._H_cache = None
+
+        return n_prop, n_acc
 
     # -----------------------
     # public API
@@ -575,7 +885,7 @@ class MixtureRankingModel:
                 raise ValueError(f"Unknown sampler setting: {k}")
             setattr(self.cfg, k, v)
 
-    def step(self, iteration: int = 0, theta_jump: int = 1, **overrides) -> Dict[str, Any]:
+    def step(self, iteration: int = 0, theta_jump: int = 1, ranking_jump: int = 1, **overrides) -> Dict[str, Any]:
         """Performs one MCMC step, updating z, tau, and cluster blocks/theta.
         
         Parameters
@@ -587,6 +897,10 @@ class MixtureRankingModel:
             Update theta every theta_jump iterations. Set to k > 1 to skip theta
             updates most of the time. E.g., theta_jump=5 updates theta every 5th
             iteration, skipping 4 iterations with only block updates (2-5x speedup).
+        ranking_jump : int, default=1
+            Update augmented (missing) rankings every ranking_jump iterations.
+            Only takes effect when the data contains partial rankings.  Set to
+            k > 1 to skip expensive augmentation steps most of the time.
             
         Examples
         --------
@@ -610,6 +924,15 @@ class MixtureRankingModel:
         state_z = self.state.z
         rankings = self.rankings
 
+        # Update augmented rankings for partial data (MH step)
+        aug_proposals = 0
+        aug_accepts = 0
+        if self._partial_info.has_missing and iteration % ranking_jump == 0:
+            t_start = time.time()
+            aug_proposals, aug_accepts = self._update_augmented_rankings()
+            if profiler:
+                profiler.record_stage("update_augmented_rankings", time.time() - t_start)
+
         # Update z
         t_start = time.time()
         self._update_z()
@@ -630,6 +953,11 @@ class MixtureRankingModel:
         block_accept_counts: List[int] = [0] * C
 
         for c in range(C):
+            # Skip permanently collapsed clusters — no assessors will ever be
+            # assigned to them again, so block/theta updates are meaningless.
+            if c in self._dead_clusters:
+                continue
+
             # Use cached state_z and rankings instead of accessing self repeatedly
             Rc = [r for r, zi in zip(rankings, state_z) if zi == c]
             
@@ -678,6 +1006,8 @@ class MixtureRankingModel:
             "theta_accept_counts": theta_accept_counts,
             "block_proposals": block_proposals,
             "block_accept_counts": block_accept_counts,
+            "aug_proposals": aug_proposals,
+            "aug_accepts": aug_accepts,
         }
 
     def run_mcmc(
@@ -687,6 +1017,7 @@ class MixtureRankingModel:
         burn_in: int = 0,
         thin: int = 1,
         theta_jump: int = 1,
+        ranking_jump: int = 1,
         save_samples: bool = True,
         save_tau: bool = False,
         save_theta: bool = False,
@@ -710,6 +1041,11 @@ class MixtureRankingModel:
             updates most of the time for faster sampling. E.g., theta_jump=10 updates
             theta every 10 iterations. This can provide 2-5x speedup at the cost of
             longer autocorrelation in theta chains.
+        ranking_jump : int, default=1
+            Update augmented (missing) rankings every ranking_jump iterations.
+            Only effective when the data contains partial rankings.  Set to k > 1
+            to reduce the cost of the augmentation MH sweep.  E.g., ranking_jump=5
+            updates completions every 5th iteration.
         tie_penalty : float, default=0.5
             Weight for the within-block penalty term (T_m) in distance calculations.
             The p in the K^(p) extended Kendall distance, where p=0.5 recovers the
@@ -830,6 +1166,9 @@ class MixtureRankingModel:
         if self.verbose:
             print(f"\n[MCMC] Starting run: n_iter={n_iter}, burn_in={burn_in}, thin={thin}, theta_jump={theta_jump}")
             print(f"[MCMC] Item moves per cluster: {n_item_moves_per_cluster}")
+            if self._partial_info.has_missing:
+                print(f"[MCMC] Ranking augmentation: every {ranking_jump} iterations "
+                      f"({self._partial_info.n_partial} partial assessors)")
             saved_iters = (n_iter - burn_in + thin - 1) // thin if save_samples else 0
             print(f"[MCMC] Will save {saved_iters} iterations after burn-in\n")
 
@@ -838,6 +1177,8 @@ class MixtureRankingModel:
         block_accepts_per_cluster = [0] * self.C
         theta_proposals_per_cluster = [0] * self.C
         block_proposals_per_cluster = [0] * self.C
+        aug_proposals_total = 0
+        aug_accepts_total = 0
 
         for it in range(n_iter):
             # Apply temperature annealing if active during burn-in
@@ -848,7 +1189,7 @@ class MixtureRankingModel:
                 for c in range(self.C):
                     self.state.clusters[c].theta = original_thetas[c] * temp_multiplier
             
-            info = self.step(iteration=it, theta_jump=theta_jump, n_item_moves_per_cluster=n_item_moves_per_cluster)
+            info = self.step(iteration=it, theta_jump=theta_jump, ranking_jump=ranking_jump, n_item_moves_per_cluster=n_item_moves_per_cluster)
             
             # Restore original thetas after step if annealing was applied
             if temperature_schedule is not None and it < len(temperature_schedule):
@@ -860,6 +1201,8 @@ class MixtureRankingModel:
                 block_accepts_per_cluster[c] += info["block_accepts"][c]
                 theta_proposals_per_cluster[c] += info.get("theta_proposals", [0]*self.C)[c]
                 block_proposals_per_cluster[c] += info.get("block_proposals", [0]*self.C)[c]
+            aug_proposals_total += info.get("aug_proposals", 0)
+            aug_accepts_total += info.get("aug_accepts", 0)
             
             if save_samples and it >= burn_in and ((it - burn_in) % thin == 0):
                 snapshot()
@@ -905,6 +1248,10 @@ class MixtureRankingModel:
                 theta_rate = theta_accepts_per_cluster[c] / max(1, theta_proposals_per_cluster[c]) if theta_proposals_per_cluster[c] > 0 else 0
                 block_rate = block_accepts_per_cluster[c] / max(1, block_proposals_per_cluster[c]) if block_proposals_per_cluster[c] > 0 else 0
                 print(f"  Cluster {c}: {theta_rate:.1%} | {block_rate:.1%}")
+            if self._partial_info.has_missing and aug_proposals_total > 0:
+                aug_rate = aug_accepts_total / aug_proposals_total
+                print(f"[MCMC] Augmentation acceptance: {aug_rate:.1%} "
+                      f"({aug_accepts_total}/{aug_proposals_total})")
 
         self.samples = samples
         return self.state, samples

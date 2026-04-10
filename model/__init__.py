@@ -24,6 +24,7 @@ from .TiedMallowsModel import (
     acceptance_probabilities,
     print_acceptance_summary,
 )
+from .augmentation import detect_missing, PartialRankingInfo
 
 __all__ = [
     "MixtureRankingModel",
@@ -47,4 +48,6 @@ __all__ = [
     "MCMCProfiler",
     "acceptance_probabilities",
     "print_acceptance_summary",
+    "detect_missing",
+    "PartialRankingInfo",
 ]

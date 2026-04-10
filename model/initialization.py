@@ -401,6 +401,7 @@ def init_spectral_with_z(
     delta: float = 0.5,
     theta: float = 1.0,
     py_sampling: bool = True,
+    affinity: str = 'agreement',
     seed: Optional[int] = None,
     rng: Optional[random.Random] = None,
 ) -> Tuple[List[ClusterParams], List[int]]:
@@ -425,6 +426,10 @@ def init_spectral_with_z(
     py_sampling : bool, default=True
         If True, sample number of blocks from Pitman-Yor distribution.
         If False, use simpler approach: expect ~n/2 blocks with small random variation.
+    affinity : str, default='agreement'
+        Spectral clustering affinity mode:
+        - 'agreement': precomputed Kendall-agreement similarity matrix
+        - 'rbf': standard RBF kernel on ranking position vectors
     seed : int, optional
         Random seed for reproducibility
     rng : random.Random, optional
@@ -450,25 +455,40 @@ def init_spectral_with_z(
     agreement = _build_item_agreement_matrix(rankings)
     
     # Step 2: Spectral clustering on rankings
-    ranking_agreement = np.zeros((n_rankings, n_rankings))
-    for i in range(n_rankings):
-        for j in range(i + 1, n_rankings):
-            inv = _kendall_inversions(rankings[i], rankings[j])
-            total_pairs = n_items * (n_items - 1) // 2
-            agree = total_pairs - inv
-            ranking_agreement[i, j] = agree
-            ranking_agreement[j, i] = agree
-    
-    np.fill_diagonal(ranking_agreement, n_items * (n_items - 1) // 2)
-    ranking_agreement_norm = ranking_agreement / (ranking_agreement.max() + 1e-10)
-    
-    sc = SpectralClustering(
-        n_clusters=n_clusters,
-        affinity='precomputed',
-        assign_labels='kmeans',
-        random_state=seed or 0,
-    )
-    cluster_assignment = sc.fit_predict(ranking_agreement_norm)
+    if affinity == 'agreement':
+        ranking_agreement = np.zeros((n_rankings, n_rankings))
+        for i in range(n_rankings):
+            for j in range(i + 1, n_rankings):
+                inv = _kendall_inversions(rankings[i], rankings[j])
+                total_pairs = n_items * (n_items - 1) // 2
+                agree = total_pairs - inv
+                ranking_agreement[i, j] = agree
+                ranking_agreement[j, i] = agree
+        
+        np.fill_diagonal(ranking_agreement, n_items * (n_items - 1) // 2)
+        ranking_agreement_norm = ranking_agreement / (ranking_agreement.max() + 1e-10)
+        
+        sc = SpectralClustering(
+            n_clusters=n_clusters,
+            affinity='precomputed',
+            assign_labels='kmeans',
+            random_state=seed or 0,
+        )
+        cluster_assignment = sc.fit_predict(ranking_agreement_norm)
+    else:
+        # Convert rankings (permutations) to position vectors for RBF kernel
+        pos_matrix = np.zeros((n_rankings, n_items))
+        for i, ranking in enumerate(rankings):
+            for pos, item in enumerate(ranking):
+                pos_matrix[i, item] = pos
+        
+        sc = SpectralClustering(
+            n_clusters=n_clusters,
+            affinity='rbf',
+            assign_labels='kmeans',
+            random_state=seed or 0,
+        )
+        cluster_assignment = sc.fit_predict(pos_matrix)
     
     # Step 3: For each cluster, build block structure
     clusters = []
