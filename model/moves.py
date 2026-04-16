@@ -212,10 +212,10 @@ def fast_gibbs_reassign_one_item(
     cluster_mask: Optional[np.ndarray] = None,
     include_uniform_order_prior: bool = True,
     rng: Optional[random.Random] = None,
-    tie_penalty: float = 0.5,
     log_qfact: Optional[List[float]] = None,
     block_index: Optional[List[int]] = None,
     pair_cache: Optional[np.ndarray] = None,
+    use_py_prior: bool = True,
 ) -> Tuple[List[List[int]], int, int, int]:
     """Gibbs-sample a new block assignment for one randomly chosen item.
 
@@ -328,24 +328,27 @@ def fast_gibbs_reassign_one_item(
     if log_qfact is None:
         log_qfact = build_log_qfactorials(n, q)
     log_gamma_1md = lgamma(1.0 - delta)       # log Γ(1−δ), used in Pitman-Yor size factor
-    # Denominator of the Pitman-Yor (PY) table prior: log[Γ(γ+n)/Γ(γ+1)]
-    log_py_denom = lgamma(gamma + n) - lgamma(gamma + 1)
+    if use_py_prior:
+        # Denominator of the Pitman-Yor (PY) table prior: log[Γ(γ+n)/Γ(γ+1)]
+        log_py_denom = lgamma(gamma + n) - lgamma(gamma + 1)
 
-    # PY table-count factor for the base K_minus blocks:
-    log_py_tables_base = sum(log(gamma + i * delta) for i in range(1, K_minus))
-    # PY block-size factor:
-    log_py_sizes_base = sum(lgamma(s - delta) - log_gamma_1md for s in base_sizes)
+        # PY table-count factor for the base K_minus blocks:
+        log_py_tables_base = sum(log(gamma + i * delta) for i in range(1, K_minus))
+        # PY block-size factor:
+        log_py_sizes_base = sum(lgamma(s - delta) - log_gamma_1md for s in base_sizes)
 
     # Mallows normalisation base terms:
-    base_Tm = sum(s * (s - 1) // 2 for s in base_sizes)
     base_logP = sum(lgamma(s + 1) for s in base_sizes)
     base_log_qf_sum = sum(log_qfact[s] for s in base_sizes)
 
     # ── Step 7: "create" candidate log-weights ────────────────────────────────
     # There are K_minus+1 positions where l can be inserted as a new singleton.
-    log_py_create = (log_py_tables_base + log(gamma + K_minus * delta)
-                     + log_py_sizes_base - log_py_denom)
-    log_Z_create = (-theta * tie_penalty * base_Tm + base_logP
+    if use_py_prior:
+        log_py_create = (log_py_tables_base + log(gamma + K_minus * delta)
+                         + log_py_sizes_base - log_py_denom)
+    else:
+        log_py_create = 0.0
+    log_Z_create = (base_logP
                     + log_qfact[n] - base_log_qf_sum - log_qfact[1])
     log_ord_create = -lgamma(K_minus + 2) if include_uniform_order_prior else 0.0
 
@@ -356,16 +359,22 @@ def fast_gibbs_reassign_one_item(
 
     # ── Step 8: "add" candidate log-weights ───────────────────────────────────
     # There are K_minus candidates, one for each existing block l can join.
-    log_py_add_common = log_py_tables_base + log_py_sizes_base - log_py_denom
-    log_Z_add_base = (-theta * tie_penalty * base_Tm + base_logP
+    if use_py_prior:
+        log_py_add_common = log_py_tables_base + log_py_sizes_base - log_py_denom
+    else:
+        log_py_add_common = 0.0
+    log_Z_add_base = (base_logP
                       + log_qfact[n] - base_log_qf_sum)
     log_ord_add = -lgamma(K_minus + 1) if include_uniform_order_prior else 0.0
 
     for k in range(K_minus):
         s_k = base_sizes[k]
-        contrib_l = prefix_Hlt[k] + suffix_Hgt[k + 1] + tie_penalty * N * s_k
-        log_py_k = log_py_add_common + log(s_k - delta)
-        log_Z_k = (log_Z_add_base - theta * tie_penalty * s_k
+        contrib_l = prefix_Hlt[k] + suffix_Hgt[k + 1]
+        if use_py_prior:
+            log_py_k = log_py_add_common + log(s_k - delta)
+        else:
+            log_py_k = 0.0
+        log_Z_k = (log_Z_add_base
                    + log(s_k + 1) - (log_qfact[s_k + 1] - log_qfact[s_k]))
         log_weights.append(log_py_k + log_ord_add - theta * contrib_l - N * log_Z_k)
 
@@ -387,8 +396,8 @@ def _compute_item_logweights(
     H: np.ndarray,
     N: int,
     n: int,
-    tie_penalty: float = 0.5,
     include_uniform_order_prior: bool = True,
+    use_py_prior: bool = True,
 ) -> Tuple[List[float], List[List[int]], int]:
     """Compute log-weights for all candidate placements of item *l*."""
     block_index = blocks_to_block_index(blocks, n)
@@ -427,24 +436,30 @@ def _compute_item_logweights(
 
     q = math.exp(-theta)
     log_qfact = build_log_qfactorials(n, q)
-    log_gamma_1md = lgamma(1.0 - delta)
-    log_py_denom = lgamma(gamma + n) - lgamma(gamma + 1)
+    if use_py_prior:
+        log_gamma_1md = lgamma(1.0 - delta)
+        log_py_denom = lgamma(gamma + n) - lgamma(gamma + 1)
 
-    log_py_tables_base = sum(log(gamma + i * delta) for i in range(1, K_minus))
-    log_py_sizes_base = sum(lgamma(s - delta) - log_gamma_1md for s in base_sizes)
+        log_py_tables_base = sum(log(gamma + i * delta) for i in range(1, K_minus))
+        log_py_sizes_base = sum(lgamma(s - delta) - log_gamma_1md for s in base_sizes)
 
-    base_Tm = sum(s * (s - 1) // 2 for s in base_sizes)
     base_logP = sum(lgamma(s + 1) for s in base_sizes)
     base_log_qf_sum = sum(log_qfact[s] for s in base_sizes)
 
-    log_py_create = (log_py_tables_base + log(gamma + K_minus * delta)
-                     + log_py_sizes_base - log_py_denom)
-    log_Z_create = (-theta * tie_penalty * base_Tm + base_logP
+    if use_py_prior:
+        log_py_create = (log_py_tables_base + log(gamma + K_minus * delta)
+                         + log_py_sizes_base - log_py_denom)
+    else:
+        log_py_create = 0.0
+    log_Z_create = (base_logP
                     + log_qfact[n] - base_log_qf_sum - log_qfact[1])
     log_ord_create = -lgamma(K_minus + 2) if include_uniform_order_prior else 0.0
 
-    log_py_add_common = log_py_tables_base + log_py_sizes_base - log_py_denom
-    log_Z_add_base = (-theta * tie_penalty * base_Tm + base_logP
+    if use_py_prior:
+        log_py_add_common = log_py_tables_base + log_py_sizes_base - log_py_denom
+    else:
+        log_py_add_common = 0.0
+    log_Z_add_base = (base_logP
                       + log_qfact[n] - base_log_qf_sum)
     log_ord_add = -lgamma(K_minus + 1) if include_uniform_order_prior else 0.0
 
@@ -454,9 +469,12 @@ def _compute_item_logweights(
         log_weights.append(lw_create_common - theta * (prefix_Hlt[p] + suffix_Hgt[p]))
     for k in range(K_minus):
         s_k = base_sizes[k]
-        contrib_l = prefix_Hlt[k] + suffix_Hgt[k + 1] + tie_penalty * N * s_k
-        log_py_k = log_py_add_common + log(s_k - delta)
-        log_Z_k = (log_Z_add_base - theta * tie_penalty * s_k
+        contrib_l = prefix_Hlt[k] + suffix_Hgt[k + 1]
+        if use_py_prior:
+            log_py_k = log_py_add_common + log(s_k - delta)
+        else:
+            log_py_k = 0.0
+        log_Z_k = (log_Z_add_base
                    + log(s_k + 1) - (log_qfact[s_k + 1] - log_qfact[s_k]))
         log_weights.append(log_py_k + log_ord_add - theta * contrib_l - N * log_Z_k)
 
@@ -472,11 +490,14 @@ def greedy_reassign_one_item(
     H: np.ndarray,
     N: int,
     n: int,
-    tie_penalty: float = 0.5,
+    use_py_prior: bool = True,
+    include_uniform_order_prior: bool = True,
 ) -> Tuple[List[List[int]], bool]:
     """Deterministic ICM move: place item *l* at its MAP position."""
     log_weights, base, K_minus = _compute_item_logweights(
-        blocks, l, theta, gamma, delta, H, N, n, tie_penalty)
+        blocks, l, theta, gamma, delta, H, N, n,
+        use_py_prior=use_py_prior,
+        include_uniform_order_prior=include_uniform_order_prior)
     idx = int(np.argmax(log_weights))
     new_blocks = _build_candidate(base, l, idx, K_minus)
     changed = (tuple(tuple(sorted(b)) for b in new_blocks)
@@ -492,8 +513,9 @@ def icm_sweep_cluster(
     H: np.ndarray,
     N: int,
     n: int,
-    tie_penalty: float = 0.5,
     max_sweeps: int = 50,
+    use_py_prior: bool = True,
+    include_uniform_order_prior: bool = True,
 ) -> Tuple[List[List[int]], int, int]:
     """Run ICM sweeps over all items until convergence.
 
@@ -504,7 +526,9 @@ def icm_sweep_cluster(
         sweep_moves = 0
         for l in range(n):
             blocks, changed = greedy_reassign_one_item(
-                blocks, l, theta, gamma, delta, H, N, n, tie_penalty)
+                blocks, l, theta, gamma, delta, H, N, n,
+                use_py_prior=use_py_prior,
+                include_uniform_order_prior=include_uniform_order_prior)
             if changed:
                 sweep_moves += 1
         total_moves += sweep_moves

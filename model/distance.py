@@ -3,7 +3,6 @@
 from typing import List, Callable
 import time
 
-from .blocks import T_of_sizes
 from .utils import logsumexp  # possibly unused here but convenient for testing
 
 
@@ -84,12 +83,9 @@ def total_distance_given_block_index(
     rankings: List[List[int]],
     block_index_fn: Callable[[int], int],
     K: int,
-    Tm: int,
-    tie_penalty: float = 0.5
 ) -> int:
-    """Compute sum_i (disc_i + tie_penalty*Tm) with disc_i via inversion count."""
+    """Compute sum_i disc_i (cross-block disagreements) via inversion count."""
     total = 0
-    weighted_Tm = tie_penalty * Tm
     for r in rankings:
         fw = Fenwick(K)
         seen = 0
@@ -100,32 +96,17 @@ def total_distance_given_block_index(
             inv += seen - leq
             fw.add(b, 1)
             seen += 1
-        total += inv + weighted_Tm
+        total += inv
     return total
 
 
-def total_distance_fast(rankings: List[List[int]], blocks: List[List[int]], tie_penalty: float = 0.5) -> int:
+def total_distance_fast(rankings: List[List[int]], blocks: List[List[int]]) -> int:
     """Sum_i d(r_i, blocks). Uses inversion counting (O(N n log K)).
 
-    A numba-accelerated variant is used when available, which speeds the
-    per-ranking loop substantially.  The logic is otherwise identical to
-    the original implementation.
-    
-    Distance computation breakdown:
-    - Block index creation: Maps items to block IDs (O(n))
-    - Per-ranking inversion counting: For each ranking, count disagreements using Fenwick tree (O(n log K) * N)
-    - Tm penalty: Within-block penalty term (O(K)) scaled by tie_penalty
-    
-    Parameters
-    ----------
-    rankings : list of lists
-        Rankings to compute distance for
-    blocks : list of lists  
-        Block structure
-    tie_penalty : float, default=0.5
-        Weight for the within-block penalty term (Tm). The p in K^(p) extended Kendall distance
-        (p=0.5 recovers Kemeny distance). Must match the weight used in the likelihood calculation
-        for consistency. Distance formula: sum_i (inversions_i + tie_penalty*Tm).
+    Returns the total cross-block disagreements across all rankings.
+    The tie penalty p·Tm term that appears in the extended Kendall
+    distance cancels analytically with the corresponding term in Z*,
+    so it is not computed.
     """
     if not rankings:
         return 0
@@ -144,24 +125,14 @@ def total_distance_fast(rankings: List[List[int]], blocks: List[List[int]], tie_
     blk = blocks_to_block_index(blocks, n, validate=False)
     if profiler:
         profiler.record_operation("block_index_creation", time.time() - t_start)
-    
-    # Profile Tm calculation
-    if profiler:
-        t_start = time.time()
-    Tm = T_of_sizes(sizes)
-    weighted_Tm = tie_penalty * Tm  # Apply weight to within-block penalty
-    if profiler:
-        profiler.record_operation("within_block_penalty_calc", time.time() - t_start)
 
     if _USE_NUMBA:
-        # convert python lists to simple arrays for njit call
-        # numba supports typed List; easiest is to use same cross-count function
         if profiler:
             t_start = time.time()
         total = 0
         for r in rankings:
             inv = _cross_block_disagreements_fast_nb(r, blk, K)
-            total += inv + weighted_Tm
+            total += inv
         if profiler:
             profiler.record_operation("inversion_counting_all_rankings", time.time() - t_start)
         return total
@@ -172,7 +143,7 @@ def total_distance_fast(rankings: List[List[int]], blocks: List[List[int]], tie_
     total = 0
     for r in rankings:
         disc = cross_block_disagreements_fast(r, blk, K)
-        total += disc + weighted_Tm
+        total += disc
     if profiler:
         profiler.record_operation("inversion_counting_all_rankings", time.time() - t_start)
     return total

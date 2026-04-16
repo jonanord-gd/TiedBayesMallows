@@ -9,6 +9,15 @@ from typing import Dict, Any, Optional, List
 import math
 
 
+def _saved_theta_update_iterations(samples) -> Optional[int]:
+    """Count saved draws where a theta update was actually attempted."""
+    saved_iterations = getattr(samples, "saved_iterations", None)
+    theta_jump = max(1, getattr(samples, "theta_jump", 1))
+    if not saved_iterations:
+        return None
+    return sum(1 for it in saved_iterations if it % theta_jump == 0)
+
+
 def acceptance_probabilities(
     samples,
     n_clusters: int,
@@ -101,18 +110,20 @@ def acceptance_probabilities(
     elif getattr(samples, "theta_accepts", None):
         T_theta = len(samples.theta_accepts)
         if T_theta > 0:
+            theta_update_iterations = _saved_theta_update_iterations(samples)
+            denom = theta_update_iterations if theta_update_iterations is not None else T_theta
             per_cluster_theta = []
             for c in range(n_clusters):
                 n_accepts = sum(samples.theta_accepts[t][c] for t in range(T_theta))
                 per_cluster_theta.append({
                     "cluster": c,
                     "n_accepts": n_accepts,
-                    "acceptance_rate": n_accepts / T_theta,
+                    "acceptance_rate": (n_accepts / denom) if denom > 0 else None,
                 })
             results["theta"] = {
                 "per_cluster": per_cluster_theta,
-                "overall_mean_acceptance": sum(x["acceptance_rate"] for x in per_cluster_theta) / len(per_cluster_theta),
-                "n_iterations": T_theta,
+                "overall_mean_acceptance": sum(x["acceptance_rate"] for x in per_cluster_theta if x["acceptance_rate"] is not None) / len([x for x in per_cluster_theta if x["acceptance_rate"] is not None]) if per_cluster_theta else None,
+                "n_iterations": denom,
             }
 
     if getattr(samples, "block_accept_counts", None) and getattr(samples, "block_proposals", None):
@@ -150,6 +161,18 @@ def acceptance_probabilities(
                 "per_cluster": per_cluster_blk,
                 "overall_mean_acceptance": sum(x["acceptance_rate"] for x in per_cluster_blk) / len(per_cluster_blk),
                 "n_iterations": T_blk,
+            }
+
+    if getattr(samples, "split_merge_proposals", None) is not None and getattr(samples, "split_merge_accept_counts", None) is not None:
+        Tsm = len(samples.split_merge_proposals)
+        if Tsm > 0:
+            n_props = sum(samples.split_merge_proposals)
+            n_accepts = sum(samples.split_merge_accept_counts)
+            results["split_merge"] = {
+                "n_proposals": n_props,
+                "n_accepts": n_accepts,
+                "acceptance_rate": (n_accepts / n_props) if n_props > 0 else None,
+                "n_iterations": Tsm,
             }
 
     # Fallback: logp-based improvement heuristic (less specific)
@@ -203,7 +226,23 @@ def acceptance_probabilities(
                 "note": "Gibbs moves are always accepted by definition (collapsed Gibbs sampling)"
             }
         
-        elif parameter_lower in ["split_merge", "item_transfer", "ordering"]:
+        elif parameter_lower == "split_merge":
+            if "split_merge" in results:
+                sm = results["split_merge"]
+                return {
+                    "parameter": "split_merge",
+                    "n_proposals": sm.get("n_proposals", 0),
+                    "n_accepts": sm.get("n_accepts", 0),
+                    "acceptance_rate": sm.get("acceptance_rate"),
+                    "n_iterations": sm.get("n_iterations"),
+                }
+            return {
+                "parameter": "split_merge",
+                "status": "not used in this run",
+                "note": "Enable use_split_merge=True to collect split-merge acceptance data."
+            }
+
+        elif parameter_lower in ["item_transfer", "ordering"]:
             return {
                 "parameter": parameter_lower,
                 "status": "detailed tracking not available",
@@ -272,10 +311,16 @@ def print_acceptance_summary(
         else:
             print("  Mean across clusters: N/A")
 
+    if "split_merge" in stats:
+        sm = stats["split_merge"]
+        ar = sm.get("acceptance_rate")
+        ar_str = f"{ar:.2%}" if ar is not None else "N/A"
+        print(f"\nSplit-merge moves: {sm.get('n_accepts', 0)}/{sm.get('n_proposals', 0)} accepts, acceptance_rate={ar_str}")
+
     # Theta acceptance
     if "theta" in stats:
         th = stats["theta"]
-        print(f"\nTheta updates acceptance (saved iterations = {th.get('n_iterations', 'N/A')}):")
+        print(f"\nTheta updates acceptance (theta-update iterations = {th.get('n_iterations', 'N/A')}):")
         for cinfo in th.get("per_cluster", []):
             if "n_proposals" in cinfo:
                 np = cinfo.get("n_proposals", 0)
@@ -284,7 +329,9 @@ def print_acceptance_summary(
                 ar_str = f"{ar:.2%}" if ar is not None else "N/A"
                 print(f"  Cluster {cinfo['cluster']}: {na}/{np} accepts, acceptance_rate={ar_str}")
             else:
-                print(f"  Cluster {cinfo['cluster']}: {cinfo['n_accepts']} accepts, acceptance_rate={cinfo['acceptance_rate']:.2%}")
+                ar = cinfo.get("acceptance_rate")
+                ar_str = f"{ar:.2%}" if ar is not None else "N/A"
+                print(f"  Cluster {cinfo['cluster']}: {cinfo['n_accepts']} accepts, acceptance_rate={ar_str}")
         mean_th = th.get('overall_mean_acceptance')
         if mean_th is not None:
             print(f"  Mean across clusters: {mean_th:.2%}")

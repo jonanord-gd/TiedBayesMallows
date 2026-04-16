@@ -96,7 +96,7 @@ def _update_z_OLD(self):
     tie_penalty = self.cfg.tie_penalty
 
     log_tau = [math.log(t) for t in state.tau]
-    logZ = [log_Z_star_from_sizes(cache[c].sizes, state.clusters[c].theta, None, tie_penalty)
+    logZ = [log_Z_star_from_sizes(cache[c].sizes, state.clusters[c].theta)
             for c in range(C)]
 
     disagreements = self._compute_all_disagreements()

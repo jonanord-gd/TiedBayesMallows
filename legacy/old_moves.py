@@ -492,7 +492,7 @@ def gibbs_reassign_one_item(
             profiler.record_operation("distance_calculation", time.time() - t_start, "gibbs_reassign")
         sizes_cand = sizes_minus[:]
         sizes_cand[k] += 1
-        logZ = log_Z_star_from_sizes(sizes_cand, theta, None, tie_penalty=tie_penalty)
+        logZ = log_Z_star_from_sizes(sizes_cand, theta, None)
         lw = math.log(w_py) - theta * S - N * logZ
         if include_uniform_order_prior:
             lw += -math.lgamma(K_minus + 1)
@@ -511,7 +511,7 @@ def gibbs_reassign_one_item(
             sizes_cand = sizes_minus[:]
             sizes_cand.insert(pos, 1)
             K_cand = K_minus + 1
-            logZ = log_Z_star_from_sizes(sizes_cand, theta, None, tie_penalty=tie_penalty)
+            logZ = log_Z_star_from_sizes(sizes_cand, theta, None)
             lw = math.log(w_new) - theta * S - N * logZ
             if include_uniform_order_prior:
                 lw += -math.lgamma(K_cand + 1)

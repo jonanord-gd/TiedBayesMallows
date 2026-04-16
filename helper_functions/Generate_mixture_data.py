@@ -29,6 +29,7 @@ full distance recomputation at each step.
 
 from __future__ import annotations
 
+import math
 import numpy as np
 from typing import Sequence
 from collections import defaultdict
@@ -38,9 +39,12 @@ from collections import defaultdict
 # Helper: Build block mapping (pre-compute once, reuse)
 # ---------------------------------------------------------------------------
 
-def _build_block_mapping(blocks: list[list[int]]) -> dict[int, int]:
-    """Efficiently build item-to-block mapping. O(n) cost, reused throughout."""
-    block_of = {}
+def _build_block_mapping(blocks: list[list[int]], n_items: int | None = None) -> list[int]:
+    """Build an item-to-block list once and reuse it throughout sampling."""
+    if n_items is None:
+        n_items = sum(len(block) for block in blocks)
+
+    block_of = [0] * n_items
     for b_idx, block in enumerate(blocks):
         for item in block:
             block_of[item] = b_idx
@@ -53,7 +57,7 @@ def _build_block_mapping(blocks: list[list[int]]) -> dict[int, int]:
 
 def kendall_distance_tied(
     sigma: Sequence[int],
-    block_of: dict[int, int],
+    block_of: Sequence[int],
 ) -> int:
     """
     Kendall-tau distance between strict ranking σ and tied consensus ρ₀.
@@ -73,23 +77,28 @@ def kendall_distance_tied(
     int
         Kendall-tau distance.
     """
-    pos_in_sigma = {item: pos for pos, item in enumerate(sigma)}
+    block_idx = list(block_of)
+    pos_in_sigma = [0] * len(sigma)
+    for pos, item in enumerate(sigma):
+        pos_in_sigma[item] = pos
 
     dist = 0
-    items = list(block_of.keys())
-    n = len(items)
-    for a in range(n):
-        for b in range(a + 1, n):
-            i, j = items[a], items[b]
+    n = len(block_idx)
+    for i in range(n):
+        bi = block_idx[i]
+        pos_i = pos_in_sigma[i]
+        for j in range(i + 1, n):
             # Tied pairs contribute 0 to distance
-            if block_of[i] == block_of[j]:
+            bj = block_idx[j]
+            if bi == bj:
                 continue
             # Check if discordant
-            if block_of[i] < block_of[j]:
-                if pos_in_sigma[i] > pos_in_sigma[j]:
+            pos_j = pos_in_sigma[j]
+            if bi < bj:
+                if pos_i > pos_j:
                     dist += 1
             else:
-                if pos_in_sigma[j] > pos_in_sigma[i]:
+                if pos_j > pos_i:
                     dist += 1
     return dist
 
@@ -98,9 +107,7 @@ def kendall_distance_tied(
 # Gibbs sampler: O(1) per step via incremental distance
 # ---------------------------------------------------------------------------
 
-def _swap_delta(
-    sigma: list[int], pos: int, block_of: dict[int, int]
-) -> int:
+def _swap_delta(sigma_blocks: list[int], pos: int) -> int:
     """
     Change in Kendall distance from swapping sigma[pos] ↔ sigma[pos+1].
     
@@ -113,8 +120,8 @@ def _swap_delta(
         -1: swap improves (fixes disagreement)
         +1: swap worsens (creates disagreement)
     """
-    i, j = sigma[pos], sigma[pos + 1]
-    bi, bj = block_of[i], block_of[j]
+    bi = sigma_blocks[pos]
+    bj = sigma_blocks[pos + 1]
     if bi == bj:
         # Tied pair—contributes 0 regardless of order
         return 0
@@ -124,8 +131,8 @@ def _swap_delta(
 
 def _gibbs_step(
     sigma: list[int],
-    block_of: dict[int, int],
-    alpha: float,
+    sigma_blocks: list[int],
+    worsen_prob: float,
     rng: np.random.Generator,
 ) -> None:
     """
@@ -133,23 +140,69 @@ def _gibbs_step(
     
     O(1) per step using incremental _swap_delta computation.
     """
-    n = len(sigma)
-    if n < 2:
+    n_minus_1 = len(sigma) - 1
+    if n_minus_1 < 1:
         return
-    pos = int(rng.integers(0, n - 1))
-    delta = _swap_delta(sigma, pos, block_of)
+    pos = int(rng.integers(0, n_minus_1))
+    delta = _swap_delta(sigma_blocks, pos)
     if delta <= 0:
         # Tied pair or improves: always swap
         sigma[pos], sigma[pos + 1] = sigma[pos + 1], sigma[pos]
+        sigma_blocks[pos], sigma_blocks[pos + 1] = sigma_blocks[pos + 1], sigma_blocks[pos]
     else:
         # Worsens: swap with prob exp(-α)
-        if rng.random() < np.exp(-alpha):
+        if rng.random() < worsen_prob:
             sigma[pos], sigma[pos + 1] = sigma[pos + 1], sigma[pos]
+            sigma_blocks[pos], sigma_blocks[pos + 1] = sigma_blocks[pos + 1], sigma_blocks[pos]
+
+
+def _run_gibbs_steps(
+    sigma: list[int],
+    sigma_blocks: list[int],
+    worsen_prob: float,
+    rng: np.random.Generator,
+    n_steps: int,
+) -> None:
+    """Run many adjacent-swap Gibbs steps with cached local references."""
+    n_minus_1 = len(sigma) - 1
+    if n_minus_1 < 1 or n_steps <= 0:
+        return
+
+    batch_size = min(4096, n_steps)
+    remaining = n_steps
+    while remaining > 0:
+        size = batch_size if remaining >= batch_size else remaining
+        positions = rng.integers(0, n_minus_1, size=size)
+        uniforms = rng.random(size=size)
+        for pos, u in zip(positions, uniforms):
+            pos = int(pos)
+            left_block = sigma_blocks[pos]
+            right_block = sigma_blocks[pos + 1]
+            if left_block >= right_block or u < worsen_prob:
+                sigma[pos], sigma[pos + 1] = sigma[pos + 1], sigma[pos]
+                sigma_blocks[pos], sigma_blocks[pos + 1] = sigma_blocks[pos + 1], sigma_blocks[pos]
+        remaining -= size
+
+
+def _initial_sigma(
+    blocks: list[list[int]],
+    rng: np.random.Generator,
+    block_of: Sequence[int],
+) -> tuple[list[int], list[int]]:
+    """Initialize one chain ordered by blocks and shuffled within each block."""
+    sigma: list[int] = []
+    sigma_blocks: list[int] = []
+    for block in blocks:
+        shuffled = list(block)
+        rng.shuffle(shuffled)
+        sigma.extend(shuffled)
+        sigma_blocks.extend(block_of[item] for item in shuffled)
+    return sigma, sigma_blocks
 
 
 def sample_mallows_tied(
     blocks: list[list[int]],
-    alpha: float,
+    theta: float,
     rng: np.random.Generator,
     *,
     n_samples: int = 1,
@@ -166,7 +219,7 @@ def sample_mallows_tied(
     ----------
     blocks : list[list[int]]
         Consensus ρ₀ as ordered blocks (best-first).
-    alpha : float
+    theta : float
         Dispersion parameter (≥ 0).
     rng : numpy.random.Generator
     n_samples : int
@@ -181,43 +234,40 @@ def sample_mallows_tied(
     list[int] if n_samples == 1, else list[list[int]]
         Sampled ranking(s).
     """
-    if alpha < 0:
-        raise ValueError("alpha must be >= 0")
-
-    # Pre-compute block mapping once (reused throughout all steps)
-    block_of = _build_block_mapping(blocks)
+    if theta < 0:
+        raise ValueError("theta must be >= 0")
 
     n = sum(len(b) for b in blocks)
     if n == 0:
         return [] if n_samples == 1 else [[] for _ in range(n_samples)]
+
+    # Pre-compute block mapping once (reused throughout all steps)
+    block_of = _build_block_mapping(blocks, n)
 
     n2 = n * n
     if burn_in is None:
         burn_in = 10 * n2
     if thin is None:
         thin = 5 * n2
+    worsen_prob = math.exp(-theta)
 
     # Initialize: sort by block, shuffle within each block
-    sigma: list[int] = []
-    for block in blocks:
-        shuffled = list(block)
-        rng.shuffle(shuffled)
-        sigma.extend(shuffled)
+    sigma, sigma_blocks = _initial_sigma(blocks, rng, block_of)
 
     # Burn-in phase: discard these samples
-    for _ in range(burn_in):
-        _gibbs_step(sigma, block_of, alpha, rng)
+    _run_gibbs_steps(sigma, sigma_blocks, worsen_prob, rng, burn_in)
 
     # Collect samples
-    samples = []
+    samples: list[list[int]] = []
     for s in range(n_samples):
         if s > 0:
             # Thin: wait 'thin' steps between samples for independence
-            for _ in range(thin):
-                _gibbs_step(sigma, block_of, alpha, rng)
+            _run_gibbs_steps(sigma, sigma_blocks, worsen_prob, rng, thin)
         samples.append(list(sigma))
 
-    return samples[0] if n_samples == 1 else samples
+    if n_samples == 1:
+        return samples[0]
+    return samples
 
 
 
@@ -228,7 +278,7 @@ def sample_mallows_tied(
 
 def sample_mallows_tied_batch(
     blocks: list[list[int]],
-    alpha: float,
+    theta: float,
     rng: np.random.Generator,
     n_samples: int,
     burn_in: int | None = None,
@@ -244,7 +294,7 @@ def sample_mallows_tied_batch(
     ----------
     blocks : list[list[int]]
         Consensus blocks.
-    alpha : float
+    theta : float
         Dispersion parameter.
     rng : numpy.random.Generator
     n_samples : int
@@ -258,7 +308,7 @@ def sample_mallows_tied_batch(
         Always returns list of lists (even if n_samples=1), for consistency.
     """
     result = sample_mallows_tied(
-        blocks, alpha, rng,
+        blocks, theta, rng,
         n_samples=n_samples, burn_in=burn_in, thin=thin,
     )
     if n_samples == 1:
@@ -275,10 +325,11 @@ def generate_mixture_data(
     n_items: int = 10,
     C: int = 3,
     seed: int = 1,
-    alpha: float = 3.0,
+    theta: float = 3.0,
     tau: np.ndarray | None = None,
     n_blocks: int | None = None,
-    n_blocks_range: tuple[int, int] = (3, 6),
+    n_blocks_range: tuple[int, int] | None = None,
+    block_density: float | None = None,
     min_block_size: int = 1,
     burn_in: int | None = None,
     thin: int | None = None,
@@ -303,7 +354,7 @@ def generate_mixture_data(
         Number of clusters.
     seed : int
         Random seed.
-    alpha : float
+    theta : float
         Mallows dispersion.  Higher → closer to consensus.
     tau : array-like or None
         Mixture weights (length C).  None → uniform.
@@ -344,6 +395,10 @@ def generate_mixture_data(
         if tau_arr.sum() <= 0:
             raise ValueError("tau must sum to a positive value")
         tau_arr = tau_arr / tau_arr.sum()
+
+    if n_blocks is None and n_blocks_range is None:
+        _density = block_density if block_density is not None else 0.4
+        n_blocks = max(1, min(n_items, round(_density * n_items)))
 
     # ---- Helper functions for block generation ----
     def choose_k() -> int:
@@ -406,7 +461,7 @@ def generate_mixture_data(
     for c, indices in cluster_indices.items():
         # Sample len(indices) rankings from one chain for cluster c
         sampled = sample_mallows_tied_batch(
-            true_blocks[c], alpha, rng,
+            true_blocks[c], theta, rng,
             n_samples=len(indices),
             burn_in=burn_in, thin=thin,
         )

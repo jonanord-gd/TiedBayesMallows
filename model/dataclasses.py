@@ -27,6 +27,8 @@ class MCMCSamples:
     theta_samples: Optional[List[List[float]]] = None
     logp: Optional[List[float]] = None          # length T
     K: Optional[List[List[int]]] = None         # [t][c] number of blocks per cluster
+    saved_iterations: Optional[List[int]] = None  # actual MCMC iteration index for each stored draw
+    theta_jump: int = 1
     # Acceptance indicators saved per stored iteration: [t][c] 0/1
     theta_accepts: Optional[List[List[int]]] = None
     block_accepts: Optional[List[List[int]]] = None
@@ -35,6 +37,8 @@ class MCMCSamples:
     theta_accept_counts: Optional[List[List[int]]] = None
     block_proposals: Optional[List[List[int]]] = None
     block_accept_counts: Optional[List[List[int]]] = None
+    split_merge_proposals: Optional[List[int]] = None
+    split_merge_accept_counts: Optional[List[int]] = None
 
 
 @dataclass
@@ -46,11 +50,25 @@ class SamplerConfig:
     gamma: Optional[float] = None   # Pitman-Yor discount parameter (0 <= delta < 1)
     delta: Optional[float] = None   # Pitman-Yor strength/concentration parameter
 
+    # Whether to use Pitman-Yor prior on block structure.
+    # When False, a flat (non-informative) prior on partitions is used instead.
+    use_py_prior: bool = True
+
+    # Optional global split-merge rescue move for assessor clusters.
+    # Disabled by default so the original sampler behaviour is unchanged.
+    use_split_merge: bool = False
+    split_merge_prob: float = 0.05
+    split_merge_bootstrap_moves: int = 1
+    split_merge_min_size: int = 4
+
     # Metropolis-Hastings parameters for updating theta
     a_theta: float = 2.0            # shape of Gamma prior on theta
     b_theta: float = 1.0            # rate of Gamma prior on theta
     theta_step: float = 0.25        # log-normal proposal stddev for theta updates
+    adapt_theta_step: bool = True   # adapt theta_step during burn-in to target acceptance rate
+    target_theta_acceptance: float = 0.234  # target acceptance rate for theta proposals
 
-    # Tie penalty weight: the p in the K^(p) extended Kendall distance.
-    # p=0.5 gives the standard Kemeny distance. Must be in (0, 1].
-    tie_penalty: float = 0.5
+    # Whether to include a uniform prior on block orderings: 1/K!
+    # When True, more blocks are penalised factorially, favouring ties.
+    # When False, only the likelihood and (optionally) the PY prior determine K.
+    include_order_prior: bool = True

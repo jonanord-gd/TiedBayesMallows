@@ -69,10 +69,9 @@ def bench_augmentation_methods(n, N, K, frac_partial, frac_missing, n_sweeps=20,
     rng = random.Random(seed)
 
     # Create cluster/cache-like objects
-    from model.blocks import blocks_to_block_index, T_of_sizes
+    from model.blocks import blocks_to_block_index
     block_idx = blocks_to_block_index(blocks, n)
     sizes = [len(b) for b in blocks]
-    Tm = T_of_sizes(sizes)
 
     class FakeCluster:
         def __init__(self):
@@ -83,7 +82,6 @@ def bench_augmentation_methods(n, N, K, frac_partial, frac_missing, n_sweeps=20,
         def __init__(self):
             self.block_idx = block_idx
             self.K = K
-            self.Tm = Tm
             self.sizes = sizes
 
     clusters = [FakeCluster()]
@@ -93,14 +91,24 @@ def bench_augmentation_methods(n, N, K, frac_partial, frac_missing, n_sweeps=20,
     results = {}
     for method in ["incremental", "fenwick"]:
         # Fresh copy each time
-        rankings_copy = complete_rankings(rankings_raw, info, n, random.Random(seed))
+        rankings_copy = complete_rankings(
+            rankings_raw, info, n, random.Random(seed), partial_mode="top_k"
+        )
         rng_m = random.Random(seed + 1)
         t0 = time.perf_counter()
         total_prop = 0
         total_acc = 0
         for _ in range(n_sweeps):
             p, a = augmentation_mh_step(
-                rankings_copy, info, z, clusters, cache, 0.5, rng_m, n, method=method
+                rankings_copy,
+                info,
+                z,
+                clusters,
+                cache,
+                rng_m,
+                n,
+                method=method,
+                partial_mode="top_k",
             )
             total_prop += p
             total_acc += a
@@ -133,7 +141,7 @@ def bench_full_mcmc(n, N, K, frac_partial, frac_missing, n_iter=200, seed=42):
     partial = make_partial_rankings(n, N, frac_partial, frac_missing, seed)
     model_p = MixtureRankingModel(partial, n_items=n, init_clusters=[
         ClusterParams(blocks=[b[:] for b in blocks], theta=1.0, gamma=1.0, delta=0.5)
-    ], seed=seed)
+    ], seed=seed, partial_mode="top_k")
 
     # ranking_jump=1
     t0 = time.perf_counter()
@@ -143,7 +151,7 @@ def bench_full_mcmc(n, N, K, frac_partial, frac_missing, n_iter=200, seed=42):
     # ranking_jump=5
     model_p2 = MixtureRankingModel(partial, n_items=n, init_clusters=[
         ClusterParams(blocks=[b[:] for b in blocks], theta=1.0, gamma=1.0, delta=0.5)
-    ], seed=seed)
+    ], seed=seed, partial_mode="top_k")
     t0 = time.perf_counter()
     model_p2.run_mcmc(n_iter=n_iter, ranking_jump=5, save_logp=False)
     time_partial_5 = time.perf_counter() - t0
@@ -299,7 +307,11 @@ if __name__ == "__main__":
             for c_idx in range(C)
         ]
         model_p = MixtureRankingModel(
-            partial_rankings_data, n_items=n, init_clusters=clusters_p, seed=seed
+            partial_rankings_data,
+            n_items=n,
+            init_clusters=clusters_p,
+            seed=seed,
+            partial_mode="top_k",
         )
         t0 = time.perf_counter()
         model_p.run_mcmc(n_iter=n_iter, ranking_jump=rj, save_logp=False)

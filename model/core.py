@@ -25,7 +25,7 @@ from .summaries import (
     summarize_theta,
 )
 from .utils import dirichlet_sample, sample_categorical_from_logweights
-from .blocks import T_of_sizes, blocks_to_block_index
+from .blocks import blocks_to_block_index
 from .distance import total_distance_fast
 from .priors import log_Z_star_from_sizes, log_py_eppf_from_sizes, log_blocks_posterior
 from .profiling import get_profiler
@@ -69,6 +69,7 @@ class MixtureRankingModel:
         rankings: List[List[int]],
         *,
         n_items: Optional[int] = None,
+        partial_mode: str = "subset",
         init_clusters: Optional[List[ClusterParams]] = None,
         n_clusters: Optional[int] = None,
         init_mu: Optional[List[float]] = None,
@@ -87,6 +88,13 @@ class MixtureRankingModel:
         ----------
         rankings : list of permutations
             The observed strict rankings (each a permutation of 0..n-1).
+                partial_mode : {"subset", "top_k"}, default="subset"
+                        Semantics used when a ranking omits some items.
+
+                        * ``"subset"`` preserves only the observed relative order. The
+                            latent completion may interleave missing items anywhere.
+                        * ``"top_k"`` treats the observed items as a fixed prefix, with
+                            all missing items constrained to appear below them.
         init_clusters : list of ClusterParams, optional
             Initial configuration for each cluster (blocks, theta, gamma, delta).
             If omitted, clusters are auto-generated via Borda consensus with
@@ -163,13 +171,22 @@ class MixtureRankingModel:
                 )
 
         self.rng = random.Random(seed)
+        if partial_mode not in {"subset", "top_k"}:
+            raise ValueError("partial_mode must be either 'subset' or 'top_k'")
+        self.partial_mode = partial_mode
 
         # ── Partial-ranking detection & completion ────────────────────────
         self._partial_info: PartialRankingInfo = detect_missing(rankings, self.n)
         if self._partial_info.has_missing:
             # Store the original (observed) rankings and create completed copies
             self._original_rankings = [list(r) for r in rankings]
-            self.rankings = complete_rankings(rankings, self._partial_info, self.n, self.rng)
+            self.rankings = complete_rankings(
+                rankings,
+                self._partial_info,
+                self.n,
+                self.rng,
+                partial_mode=self.partial_mode,
+            )
         else:
             self._original_rankings = None
             self.rankings = rankings
@@ -221,9 +238,15 @@ class MixtureRankingModel:
         if self.C <= 0:
             raise ValueError("Need at least one cluster")
 
-        self.init_mu = init_mu if init_mu is not None else [1.0] * self.C
+        if init_mu is None:
+            self.init_mu = [1.0] * self.C
+        elif len(init_mu) == 1:
+            self.init_mu = [float(init_mu[0])] * self.C
+        else:
+            self.init_mu = list(init_mu)
+
         if len(self.init_mu) != self.C:
-            raise ValueError("init_mu must have length C")
+            raise ValueError("init_mu must have length 1 or C")
 
         # Initialize z and tau
         if init_z is not None:
@@ -301,6 +324,9 @@ class MixtureRankingModel:
         # Sampler config
         self.cfg = SamplerConfig()
 
+        # Per-cluster adaptive step sizes for theta proposals
+        self._theta_steps: List[float] = [self.cfg.theta_step] * self.C
+
         # ── Collapsed-cluster tracking ────────────────────────────────────────────
         # A cluster is marked permanently dead after COLLAPSE_PATIENCE consecutive
         # iterations with 0 assessors.  Dead clusters are excluded from all future
@@ -340,6 +366,7 @@ class MixtureRankingModel:
             if self._partial_info.has_missing:
                 print(f"[Model] Partial rankings: {self._partial_info.n_partial}/{self.N} "
                       f"assessors have missing items")
+                print(f"[Model] Partial ranking semantics: {self.partial_mode}")
                 miss_counts = [len(m) for m in self._partial_info.missing_items if m]
                 print(f"[Model]   Missing items per assessor: "
                       f"min={min(miss_counts)}, max={max(miss_counts)}, "
@@ -352,22 +379,20 @@ class MixtureRankingModel:
     # caching
     # -----------------------
     class _ClusterCache:
-        __slots__ = ("sizes", "K", "Tm", "block_idx")
+        __slots__ = ("sizes", "K", "block_idx")
         
-        def __init__(self, sizes: List[int], K: int, Tm: int, block_idx: List[int]):
+        def __init__(self, sizes: List[int], K: int, block_idx: List[int]):
             self.sizes = sizes
             self.K = K
-            self.Tm = Tm
             self.block_idx = block_idx
 
     def _rebuild_cluster_cache(self, c: int) -> None:
         cl = self.state.clusters[c]
         sizes = [len(b) for b in cl.blocks]
         K = len(sizes)
-        Tm = T_of_sizes(sizes)
         blk = blocks_to_block_index(cl.blocks, self.n, validate=False)
         self._cache[c] = MixtureRankingModel._ClusterCache(
-            sizes=sizes, K=K, Tm=Tm, block_idx=blk
+            sizes=sizes, K=K, block_idx=blk
         )
         # Mark M row as dirty so _compute_all_disagreements rebuilds it
         if hasattr(self, '_M_dirty'):
@@ -513,7 +538,6 @@ class MixtureRankingModel:
         state = self.state
         C = self.C
         cache = self._cache
-        tie_penalty = self.cfg.tie_penalty
 
         # Per-cluster scalars (computed once per iteration)
         log_tau = np.log(np.asarray(state.tau, dtype=np.float64))
@@ -531,16 +555,14 @@ class MixtureRankingModel:
             if qkey not in self._qfact_cache:
                 self._qfact_cache[qkey] = build_log_qfactorials(self.n, q_c)
             logZ[c] = log_Z_star_from_sizes(
-                cache[c].sizes, theta_c, self._qfact_cache[qkey], tie_penalty)
-
-        Tms = np.array([cache[c].Tm for c in range(C)], dtype=np.float64)
+                cache[c].sizes, theta_c, self._qfact_cache[qkey])
 
         # N×C disagreement matrix (single matmul)
         D = self._compute_all_disagreements()  # ndarray (N, C)
 
         # Vectorised log-weights: shape (N, C)
         logweights = (log_tau[np.newaxis, :]
-                      - thetas[np.newaxis, :] * (D + tie_penalty * Tms[np.newaxis, :])
+                      - thetas[np.newaxis, :] * D
                       - logZ[np.newaxis, :])
 
         # Zero out dead clusters: force log-weight to -inf so they can never
@@ -699,7 +721,6 @@ class MixtureRankingModel:
         state = self.state
         rng = self.rng
         cache = self._cache
-        tie_penalty = self.cfg.tie_penalty
         
         n_c = len(rankings_c)
         if n_c == 0:
@@ -712,12 +733,12 @@ class MixtureRankingModel:
         theta_new = math.exp(math.log(theta_old) + rng.gauss(0.0, step))
 
         # S_c from cached D matrix (computed during _update_z): column sum
-        # D[i,c] = cross-block disagreements; add tie penalty for full distance
+        # D[i,c] = cross-block disagreements (tie penalty cancels with Z*)
         if hasattr(self, '_D_cache') and self._D_cache is not None:
             cluster_mask = state.z == c
-            S_c = float(self._D_cache[cluster_mask, c].sum()) + tie_penalty * cc.Tm * n_c
+            S_c = float(self._D_cache[cluster_mask, c].sum())
         else:
-            S_c = total_distance_fast(rankings_c, cl.blocks, tie_penalty)
+            S_c = total_distance_fast(rankings_c, cl.blocks)
 
         # Reuse cached q-factorials where possible
         qfact_cache = getattr(self, '_qfact_cache', {})
@@ -728,7 +749,7 @@ class MixtureRankingModel:
             if lqf is None:
                 lqf = build_log_qfactorials(self.n, q)
                 qfact_cache[qkey] = lqf
-            return log_Z_star_from_sizes(cc.sizes, theta, lqf, tie_penalty)
+            return log_Z_star_from_sizes(cc.sizes, theta, lqf)
 
         lp_old = (-theta_old * S_c) - n_c * _logZ(theta_old) + self._log_gamma_pdf(theta_old, a_theta, b_theta)
         lp_new = (-theta_new * S_c) - n_c * _logZ(theta_new) + self._log_gamma_pdf(theta_new, a_theta, b_theta)
@@ -796,10 +817,10 @@ class MixtureRankingModel:
                 delta=delta,
                 H=_fast_H,
                 rng=rng,
-                tie_penalty=cfg.tie_penalty,
                 log_qfact=_log_qfact,
                 block_index=current_block_idx,
                 pair_cache=_pair_cache,
+                use_py_prior=cfg.use_py_prior,
             )
             t_move_elapsed = time.time() - t_move_start
 
@@ -836,9 +857,9 @@ class MixtureRankingModel:
     def _update_augmented_rankings(self) -> Tuple[int, int]:
         """MH augmentation step for partial rankings.
 
-        For each assessor with missing items, propose swapping two unranked
-        items and accept/reject based on the Mallows likelihood under the
-        assessor's current cluster.  Accepted swaps modify
+        For each assessor with missing items, propose a move that respects the
+        configured partial-ranking semantics and accept/reject based on the
+        Mallows likelihood under the assessor's current cluster. Accepted swaps modify
         ``self.rankings`` in-place and the corresponding U_all rows are
         recomputed.
 
@@ -853,9 +874,9 @@ class MixtureRankingModel:
             z=self.state.z,
             clusters=self.state.clusters,
             cache=self._cache,
-            tie_penalty=self.cfg.tie_penalty,
             rng=self.rng,
             n=self.n,
+            partial_mode=self.partial_mode,
         )
 
         if n_acc > 0:
@@ -874,6 +895,224 @@ class MixtureRankingModel:
             self._H_cache = None
 
         return n_prop, n_acc
+
+    def _make_state_snapshot(self) -> Dict[str, Any]:
+        """Deep-ish copy of the current sampler state for safe proposal rollback."""
+        return {
+            "z": np.array(self.state.z, dtype=np.intp).copy(),
+            "tau": list(self.state.tau),
+            "clusters": [
+                ClusterParams(
+                    blocks=[b[:] for b in cl.blocks],
+                    theta=cl.theta,
+                    gamma=cl.gamma,
+                    delta=cl.delta,
+                )
+                for cl in self.state.clusters
+            ],
+            "zero_streak": list(self._zero_streak),
+            "dead_clusters": set(self._dead_clusters),
+        }
+
+    def _refresh_caches_after_global_state_change(self) -> None:
+        """Rebuild all cluster caches after a global state proposal."""
+        self._rebuild_all_cluster_caches()
+        self._D_cache = None
+        self._H_cache = None
+        self._M_dirty = [True] * self.C
+
+    def _restore_state_snapshot(self, snap: Dict[str, Any]) -> None:
+        """Restore a previously snapshotted state after a rejected proposal."""
+        self.state = MixtureState(
+            clusters=snap["clusters"],
+            z=np.array(snap["z"], dtype=np.intp),
+            tau=list(snap["tau"]),
+        )
+        self._zero_streak = list(snap["zero_streak"])
+        self._dead_clusters = set(snap["dead_clusters"])
+        self._refresh_caches_after_global_state_change()
+
+    def _set_tau_from_assignments(self) -> None:
+        """Deterministic positive tau update used inside split-merge proposals."""
+        counts = np.bincount(self.state.z, minlength=self.C).astype(np.float64)
+        prior = np.asarray(self.init_mu, dtype=np.float64)
+        weights = counts + np.maximum(prior, 1e-6)
+        total = float(weights.sum())
+        if total <= 0:
+            self.state.tau = [1.0 / self.C] * self.C
+        else:
+            self.state.tau = (weights / total).tolist()
+
+    @staticmethod
+    def _singleton_blocks_from_ranking(ranking: List[int]) -> List[List[int]]:
+        return [[int(item)] for item in ranking]
+
+    def _propose_merge_clusters(self, c_a: int, c_b: int) -> Optional[List[int]]:
+        """Merge two occupied clusters into one, keeping the better consensus."""
+        if c_a == c_b:
+            return None
+
+        counts = np.bincount(self.state.z, minlength=self.C)
+        if counts[c_a] <= 0 or counts[c_b] <= 0:
+            return None
+
+        c_keep, c_drop = (c_a, c_b) if counts[c_a] >= counts[c_b] else (c_b, c_a)
+        merge_mask = (self.state.z == c_keep) | (self.state.z == c_drop)
+        merge_idx = np.where(merge_mask)[0]
+        rankings_merge = [self.rankings[i] for i in merge_idx]
+
+        keep_cl = self.state.clusters[c_keep]
+        drop_cl = self.state.clusters[c_drop]
+        score_keep = total_distance_fast(rankings_merge, keep_cl.blocks)
+        score_drop = total_distance_fast(rankings_merge, drop_cl.blocks)
+        if score_drop < score_keep:
+            keep_cl.blocks = [b[:] for b in drop_cl.blocks]
+
+        w_keep = max(1, int(counts[c_keep]))
+        w_drop = max(1, int(counts[c_drop]))
+        keep_cl.theta = max(
+            1e-6,
+            (w_keep * keep_cl.theta + w_drop * drop_cl.theta) / (w_keep + w_drop),
+        )
+
+        self.state.z[merge_mask] = c_keep
+        self._dead_clusters.discard(c_keep)
+        self._dead_clusters.discard(c_drop)
+        self._zero_streak[c_keep] = 0
+        self._zero_streak[c_drop] = 0
+        self._set_tau_from_assignments()
+        return [c_keep, c_drop]
+
+    def _propose_split_cluster(
+        self,
+        c_source: int,
+        i_anchor: int,
+        j_anchor: int,
+    ) -> Optional[List[int]]:
+        """Split one occupied cluster into two using two anchor assessors."""
+        counts = np.bincount(self.state.z, minlength=self.C)
+        if counts[c_source] < max(2, int(self.cfg.split_merge_min_size)):
+            return None
+
+        empty_clusters = [
+            c for c in range(self.C)
+            if c != c_source and counts[c] == 0
+        ]
+        if not empty_clusters:
+            return None
+        empty_clusters.sort(key=lambda c: (c not in self._dead_clusters, c))
+        c_new = empty_clusters[0]
+
+        members = np.where(self.state.z == c_source)[0]
+        if i_anchor not in members or j_anchor not in members or i_anchor == j_anchor:
+            return None
+
+        blocks_left = self._singleton_blocks_from_ranking(self.rankings[i_anchor])
+        blocks_right = self._singleton_blocks_from_ranking(self.rankings[j_anchor])
+
+        z_new = np.array(self.state.z, dtype=np.intp).copy()
+        z_new[j_anchor] = c_new
+        for idx in members:
+            if idx == i_anchor:
+                z_new[idx] = c_source
+                continue
+            if idx == j_anchor:
+                z_new[idx] = c_new
+                continue
+
+            d_left = total_distance_fast([self.rankings[idx]], blocks_left)
+            d_right = total_distance_fast([self.rankings[idx]], blocks_right)
+            if d_right < d_left or (d_right == d_left and self.rng.random() < 0.5):
+                z_new[idx] = c_new
+            else:
+                z_new[idx] = c_source
+
+        left_n = int(np.sum(z_new[members] == c_source))
+        right_n = int(np.sum(z_new[members] == c_new))
+        if left_n == 0 or right_n == 0:
+            return None
+
+        self.state.z = z_new
+        source_cl = self.state.clusters[c_source]
+        target_cl = self.state.clusters[c_new]
+        source_theta = source_cl.theta
+
+        source_cl.blocks = blocks_left
+        target_cl.blocks = blocks_right
+        target_cl.theta = max(1e-6, source_theta * math.exp(self.rng.gauss(0.0, 0.05)))
+        target_cl.gamma = source_cl.gamma
+        target_cl.delta = source_cl.delta
+
+        self._dead_clusters.discard(c_source)
+        self._dead_clusters.discard(c_new)
+        self._zero_streak[c_source] = 0
+        self._zero_streak[c_new] = 0
+        self._set_tau_from_assignments()
+        return [c_source, c_new]
+
+    def _maybe_split_merge_move(self) -> Tuple[int, int]:
+        """Optional exploratory split-merge rescue move for assessor clusters.
+
+        This move is disabled by default. When enabled, it proposes either:
+        - a merge of two occupied clusters chosen by anchor assessors, or
+        - a split of one occupied cluster into an empty slot.
+
+        Rejected proposals are rolled back exactly, so the feature is safe to
+        switch on and off during experimentation.
+        """
+        cfg = self.cfg
+        if (not cfg.use_split_merge) or self.C < 2 or self.N < 2:
+            return 0, 0
+        if self.rng.random() >= float(cfg.split_merge_prob):
+            return 0, 0
+
+        active_idx = [i for i in range(self.N) if int(self.state.z[i]) not in self._dead_clusters]
+        if len(active_idx) < 2:
+            return 0, 0
+
+        i_anchor, j_anchor = self.rng.sample(active_idx, 2)
+        c_i = int(self.state.z[i_anchor])
+        c_j = int(self.state.z[j_anchor])
+
+        old_lp = self.log_joint()
+        snapshot = self._make_state_snapshot()
+
+        try:
+            if c_i == c_j:
+                affected = self._propose_split_cluster(c_i, i_anchor, j_anchor)
+            else:
+                affected = self._propose_merge_clusters(c_i, c_j)
+
+            if not affected:
+                return 0, 0
+
+            self._refresh_caches_after_global_state_change()
+
+            bootstrap_moves = max(0, int(cfg.split_merge_bootstrap_moves))
+            if bootstrap_moves > 0:
+                for c in affected:
+                    Rc = [r for r, zi in zip(self.rankings, self.state.z) if zi == c]
+                    if Rc:
+                        self._update_cluster_blocks(
+                            c,
+                            Rc,
+                            n_item_moves=bootstrap_moves,
+                            gamma=cfg.gamma,
+                            delta=cfg.delta,
+                        )
+                self._refresh_caches_after_global_state_change()
+
+            new_lp = self.log_joint()
+            log_acc = min(0.0, new_lp - old_lp)
+            accepted = math.log(max(self.rng.random(), 1e-300)) < log_acc
+        except Exception:
+            accepted = False
+
+        if not accepted:
+            self._restore_state_snapshot(snapshot)
+            return 1, 0
+
+        return 1, 1
 
     # -----------------------
     # public API
@@ -945,6 +1184,15 @@ class MixtureRankingModel:
         if profiler:
             profiler.record_stage("update_tau", time.time() - t_start)
 
+        # Optional global rescue move: occasionally split or merge clusters.
+        t_start = time.time()
+        split_merge_proposals, split_merge_accepts = self._maybe_split_merge_move()
+        if profiler and split_merge_proposals > 0:
+            profiler.record_stage("split_merge", time.time() - t_start)
+
+        # state.z may have changed after split-merge; refresh cached reference.
+        state_z = self.state.z
+
         theta_accepts: List[int] = [0] * C
         block_accepts: List[int] = [0] * C
         theta_proposals: List[int] = [0] * C
@@ -980,12 +1228,12 @@ class MixtureRankingModel:
             # Update cluster theta - OPTIMIZATION: Only if we're on a theta_jump iteration
             t_start = time.time()
             if iteration % theta_jump == 0:
-                # Update theta
+                # Update theta using per-cluster adaptive step size
                 tp, ta = self._update_cluster_theta(
                     c, Rc,
                     a_theta=cfg.a_theta,
                     b_theta=cfg.b_theta,
-                    step=cfg.theta_step,
+                    step=self._theta_steps[c],
                 )
                 theta_proposals[c] = int(tp)
                 theta_accept_counts[c] = int(ta)
@@ -1006,6 +1254,8 @@ class MixtureRankingModel:
             "theta_accept_counts": theta_accept_counts,
             "block_proposals": block_proposals,
             "block_accept_counts": block_accept_counts,
+            "split_merge_proposals": split_merge_proposals,
+            "split_merge_accept_counts": split_merge_accepts,
             "aug_proposals": aug_proposals,
             "aug_accepts": aug_accepts,
         }
@@ -1024,10 +1274,12 @@ class MixtureRankingModel:
         save_logp: bool = True,
         save_acceptance_details: bool = False,
         n_item_moves_per_cluster: int = 2,
-        tie_penalty: float = 0.5,
+        use_py_prior: bool = True,
+        include_order_prior: bool = True,
         use_annealing: bool = False,
         annealing_schedule: Optional[List[float]] = None,
         annealing_schedule_type: str = "linear",
+        annealing_plateau_frac: float = 0.5,
         temp_min: float = 0.5,
         temp_max: float = 1.0,
         **sampler_kwargs,
@@ -1046,14 +1298,6 @@ class MixtureRankingModel:
             Only effective when the data contains partial rankings.  Set to k > 1
             to reduce the cost of the augmentation MH sweep.  E.g., ranking_jump=5
             updates completions every 5th iteration.
-        tie_penalty : float, default=0.5
-            Weight for the within-block penalty term (T_m) in distance calculations.
-            The p in the K^(p) extended Kendall distance, where p=0.5 recovers the
-            Kemeny distance. Controls how much ties in rankings are penalized. p should be a value between (0, 1]
-            Must be > 0.
-            - Values < 0.5: De-emphasize ties relative to inversions (Only a near metric)
-            - Values = 0.5: Kemeny/standard Mallows model (default)
-            - Values > 0.5: Emphasize ties relative to inversions 
         use_annealing : bool, default=False
             If True, apply temperature annealing during burn-in to prevent cluster collapse.
             Starts with a soft likelihood (low theta) to explore cluster configurations,
@@ -1064,8 +1308,12 @@ class MixtureRankingModel:
             E.g., [0.5, 1.0, 2.0, 5.0] creates a 4-phase annealing schedule.
         annealing_schedule_type : str, default="linear"
             How to generate the annealing schedule if annealing_schedule is None.
-            Options: "linear" (linear interpolation), "exponential" (exponential growth).
+            Options: "linear" (linear interpolation), "exponential" (exponential growth),
+            "plateau" (hold at temp_min for an initial fraction, then linearly ramp up).
             Only used if use_annealing=True and annealing_schedule is None.
+        annealing_plateau_frac : float, default=0.5
+            For the "plateau" schedule only: fraction of annealing iterations to keep
+            fixed at temp_min before the ramp toward temp_max begins.
         temp_min : float, default=0.5
             Starting temperature (multiplier for theta) during annealing.
             Lower values (0.1-0.5) = softer likelihood = better exploration.
@@ -1093,8 +1341,8 @@ class MixtureRankingModel:
             raise ValueError("thin must be >= 1")
         if burn_in < 0:
             raise ValueError("burn_in must be >= 0")
-        if tie_penalty <= 0:
-            raise ValueError("tie_penalty must be > 0")
+        if not 0.0 <= annealing_plateau_frac < 1.0:
+            raise ValueError("annealing_plateau_frac must be in [0, 1)")
 
         # Setup temperature annealing schedule
         temperature_schedule: Optional[List[float]] = None
@@ -1112,12 +1360,31 @@ class MixtureRankingModel:
                         temp_min * (ratio ** (t / max(1, n_anneal_iters - 1)))
                         for t in range(n_anneal_iters)
                     ]
-                else:  # linear (default)
+                elif annealing_schedule_type == "plateau":
+                    # Plateau schedule: remain exploratory early, then ramp linearly.
+                    plateau_iters = min(
+                        int(round(annealing_plateau_frac * n_anneal_iters)),
+                        max(0, n_anneal_iters - 1),
+                    )
+                    ramp_iters = n_anneal_iters - plateau_iters
+                    if ramp_iters == 1:
+                        ramp = [temp_max]
+                    else:
+                        ramp = [
+                            temp_min + (temp_max - temp_min) * (t / max(1, ramp_iters - 1))
+                            for t in range(ramp_iters)
+                        ]
+                    temperature_schedule = ([temp_min] * plateau_iters) + ramp
+                elif annealing_schedule_type == "linear":
                     # Linear schedule: temp(t) = temp_min + (temp_max - temp_min) * (t / n_anneal)
                     temperature_schedule = [
                         temp_min + (temp_max - temp_min) * (t / max(1, n_anneal_iters - 1))
                         for t in range(n_anneal_iters)
                     ]
+                else:
+                    raise ValueError(
+                        "annealing_schedule_type must be one of: linear, exponential, plateau"
+                    )
 
         # Reset profiler at the start of a run if enabled
         profiler = get_profiler()
@@ -1130,9 +1397,11 @@ class MixtureRankingModel:
                 n_item_moves_per_cluster = sampler_kwargs.pop("n_item_moves_per_cluster")
             self.set_sampler(**sampler_kwargs)
 
-        # Apply tie penalty weight
-        if tie_penalty != 0.5:
-            self.cfg.tie_penalty = tie_penalty
+        # Apply Pitman-Yor prior flag
+        self.cfg.use_py_prior = use_py_prior
+
+        # Apply block-ordering prior flag
+        self.cfg.include_order_prior = include_order_prior
 
         samples: Optional[MCMCSamples] = None
         if save_samples:
@@ -1143,12 +1412,16 @@ class MixtureRankingModel:
                 theta_samples=[] if save_theta else None,
                 K = [],
                 logp = [],
+                saved_iterations=[],
+                theta_jump=theta_jump,
                 theta_accepts = [],
                 block_accepts = [],
                 theta_proposals = [] if save_acceptance_details else None,
                 theta_accept_counts = [] if save_acceptance_details else None,
                 block_proposals = [] if save_acceptance_details else None,
                 block_accept_counts = [] if save_acceptance_details else None,
+                split_merge_proposals = [],
+                split_merge_accept_counts = [],
             )
 
         def snapshot() -> None:
@@ -1179,6 +1452,16 @@ class MixtureRankingModel:
         block_proposals_per_cluster = [0] * self.C
         aug_proposals_total = 0
         aug_accepts_total = 0
+        split_merge_proposals_total = 0
+        split_merge_accepts_total = 0
+
+        # Adaptive theta step size (Robbins-Monro) during burn-in
+        adapt_theta = self.cfg.adapt_theta_step and burn_in > 0
+        target_acc = self.cfg.target_theta_acceptance
+        # Per-cluster proposal count for computing decaying learning rate
+        _theta_n_proposals = [0] * self.C
+        # Reset per-cluster steps to current config value at start of run
+        self._theta_steps = [self.cfg.theta_step] * self.C
 
         for it in range(n_iter):
             # Apply temperature annealing if active during burn-in
@@ -1195,6 +1478,22 @@ class MixtureRankingModel:
             if temperature_schedule is not None and it < len(temperature_schedule):
                 for c in range(self.C):
                     self.state.clusters[c].theta = original_thetas[c]
+
+            # ── Adapt theta step sizes during burn-in (Robbins-Monro) ──
+            if adapt_theta and it < burn_in:
+                for c in range(self.C):
+                    n_prop = info["theta_proposals"][c]
+                    if n_prop > 0:
+                        _theta_n_proposals[c] += n_prop
+                        accepted = info["theta_accept_counts"][c]
+                        # Decaying learning rate: γ_t = 1 / sqrt(t)
+                        gamma_t = 1.0 / math.sqrt(_theta_n_proposals[c])
+                        # Update on log scale: log(σ) += γ * (α - target)
+                        log_step = math.log(self._theta_steps[c])
+                        log_step += gamma_t * (accepted - target_acc)
+                        # Clamp to reasonable range [1e-4, 10]
+                        log_step = max(math.log(1e-4), min(math.log(10.0), log_step))
+                        self._theta_steps[c] = math.exp(log_step)
             
             for c in range(self.C):
                 theta_accepts_per_cluster[c] += info["theta_accepts"][c]
@@ -1203,12 +1502,20 @@ class MixtureRankingModel:
                 block_proposals_per_cluster[c] += info.get("block_proposals", [0]*self.C)[c]
             aug_proposals_total += info.get("aug_proposals", 0)
             aug_accepts_total += info.get("aug_accepts", 0)
+            split_merge_proposals_total += info.get("split_merge_proposals", 0)
+            split_merge_accepts_total += info.get("split_merge_accept_counts", 0)
             
             if save_samples and it >= burn_in and ((it - burn_in) % thin == 0):
                 snapshot()
                 assert samples is not None
+                if samples.saved_iterations is not None:
+                    samples.saved_iterations.append(it)
                 samples.theta_accepts.append(info["theta_accepts"])
                 samples.block_accepts.append(info["block_accepts"])
+                if samples.split_merge_proposals is not None:
+                    samples.split_merge_proposals.append(int(info.get("split_merge_proposals", 0)))
+                if samples.split_merge_accept_counts is not None:
+                    samples.split_merge_accept_counts.append(int(info.get("split_merge_accept_counts", 0)))
                 if save_acceptance_details:
                     if samples.theta_proposals is not None:
                         samples.theta_proposals.append(info.get("theta_proposals", [0]*self.C))
@@ -1248,6 +1555,14 @@ class MixtureRankingModel:
                 theta_rate = theta_accepts_per_cluster[c] / max(1, theta_proposals_per_cluster[c]) if theta_proposals_per_cluster[c] > 0 else 0
                 block_rate = block_accepts_per_cluster[c] / max(1, block_proposals_per_cluster[c]) if block_proposals_per_cluster[c] > 0 else 0
                 print(f"  Cluster {c}: {theta_rate:.1%} | {block_rate:.1%}")
+            if adapt_theta:
+                print(f"[MCMC] Adapted theta step sizes (target acceptance={target_acc:.3f}):")
+                for c in range(self.C):
+                    print(f"  Cluster {c}: {self._theta_steps[c]:.4f} (was {self.cfg.theta_step:.4f})")
+            if split_merge_proposals_total > 0:
+                sm_rate = split_merge_accepts_total / split_merge_proposals_total
+                print(f"[MCMC] Split-merge acceptance: {sm_rate:.1%} "
+                      f"({split_merge_accepts_total}/{split_merge_proposals_total})")
             if self._partial_info.has_missing and aug_proposals_total > 0:
                 aug_rate = aug_accepts_total / aug_proposals_total
                 print(f"[MCMC] Augmentation acceptance: {aug_rate:.1%} "
@@ -1440,8 +1755,9 @@ class MixtureRankingModel:
                     H=H_c,
                     N=N_c,
                     n=self.n,
-                    tie_penalty=self.cfg.tie_penalty,
                     max_sweeps=max_sweeps,
+                    use_py_prior=self.cfg.use_py_prior,
+                    include_uniform_order_prior=self.cfg.include_order_prior,
                 )
 
                 cl.blocks = new_blocks
@@ -1521,7 +1837,6 @@ class MixtureRankingModel:
         state = self.state
         init_mu = self.init_mu
         C = self.C
-        tie_penalty = self.cfg.tie_penalty
 
         lp = 0.0
 
@@ -1548,8 +1863,8 @@ class MixtureRankingModel:
                 n_c = int(mask.sum())
                 if n_c == 0:
                     continue
-                # S_c = sum of (cross-block disagreements + tie_penalty * Tm)
-                S_c = float(self._D_cache[mask, c].sum()) + tie_penalty * self._cache[c].Tm * n_c
+                # S_c = cross-block disagreements (tie penalty cancels with Z*)
+                S_c = float(self._D_cache[mask, c].sum())
 
                 # logZ via cached q-factorials
                 q_c = math.exp(-cl.theta)
@@ -1557,18 +1872,24 @@ class MixtureRankingModel:
                 if qkey not in qfact_cache:
                     qfact_cache[qkey] = build_log_qfactorials(self.n, q_c)
                 logZ_c = log_Z_star_from_sizes(
-                    self._cache[c].sizes, cl.theta, qfact_cache[qkey], tie_penalty)
+                    self._cache[c].sizes, cl.theta, qfact_cache[qkey])
 
-                # Pitman-Yor prior
-                logpy = log_py_eppf_from_sizes(self._cache[c].sizes, cl.gamma, cl.delta)
+                # Pitman-Yor prior (optional)
+                if self.cfg.use_py_prior:
+                    logpy = log_py_eppf_from_sizes(self._cache[c].sizes, cl.gamma, cl.delta)
+                else:
+                    logpy = 0.0
                 K = len(cl.blocks)
 
-                lp += (-cl.theta * S_c) - (n_c * logZ_c) + logpy - math.lgamma(K + 1)
+                log_ord = math.lgamma(K + 1) if self.cfg.include_order_prior else 0.0
+                lp += (-cl.theta * S_c) - (n_c * logZ_c) + logpy - log_ord
             else:
                 Rc = [r for r, zi in zip(self.rankings, state.z) if zi == c]
                 if not Rc:
                     continue
-                lp += log_blocks_posterior(Rc, cl.blocks, cl.theta, cl.gamma, cl.delta, tie_penalty=tie_penalty)
+                lp += log_blocks_posterior(Rc, cl.blocks, cl.theta, cl.gamma, cl.delta,
+                                          use_py_prior=self.cfg.use_py_prior,
+                                          include_order_prior=self.cfg.include_order_prior)
 
             lp += self._log_gamma_pdf(cl.theta, self.cfg.a_theta, self.cfg.b_theta)
 

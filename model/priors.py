@@ -30,9 +30,7 @@ def build_log_qfactorials(n: int, q: float) -> List[float]:
 
 
 # internal cached computation when log_qfact is not provided
-# Note: tie_penalty is not cached to avoid cache invalidation issues
-# Use log_Z_star_from_sizes instead, which handles this properly
-def _log_Z_star_core(sizes_tuple: Tuple[int, ...], theta: float, tie_penalty: float = 0.5) -> float:
+def _log_Z_star_core(sizes_tuple: Tuple[int, ...], theta: float) -> float:
     # builds qfactorials internally; sizes_tuple is tuple of ints
     sizes = list(sizes_tuple)
     if theta <= 0:
@@ -40,34 +38,32 @@ def _log_Z_star_core(sizes_tuple: Tuple[int, ...], theta: float, tie_penalty: fl
     n = sum(sizes)
     q = math.exp(-1.0 * theta)
 
-    Tm = sum(s * (s - 1) // 2 for s in sizes)
     logP = sum(math.lgamma(s + 1) for s in sizes)
 
     log_qfact = build_log_qfactorials(n, q)
-    return (-theta * tie_penalty * Tm) + logP + (log_qfact[n] - sum(log_qfact[s] for s in sizes))
+    return logP + (log_qfact[n] - sum(log_qfact[s] for s in sizes))
 
 
-def log_Z_star_from_sizes(sizes: List[int], theta: float, log_qfact: Optional[List[float]] = None, tie_penalty: float = 0.5) -> float:
-    # if caller didn't supply precomputed log_qfactorials, use core with weight
+def log_Z_star_from_sizes(sizes: List[int], theta: float, log_qfact: Optional[List[float]] = None) -> float:
+    # if caller didn't supply precomputed log_qfactorials, use core
     if log_qfact is None:
-        return _log_Z_star_core(tuple(sizes), theta, tie_penalty)
+        return _log_Z_star_core(tuple(sizes), theta)
 
     if theta <= 0:
         return float("-inf")
     n = sum(sizes)
     q = math.exp(-1.0 * theta)
 
-    Tm = sum(s * (s - 1) // 2 for s in sizes)
     logP = sum(math.lgamma(s + 1) for s in sizes)
 
     if len(log_qfact) < n + 1:
         log_qfact = build_log_qfactorials(n, q)
 
-    return (-theta * tie_penalty * Tm) + logP + (log_qfact[n] - sum(log_qfact[s] for s in sizes))
+    return logP + (log_qfact[n] - sum(log_qfact[s] for s in sizes))
 
 
-def log_Z_star(blocks: List[List[int]], theta: float, tie_penalty: float = 0.5) -> float:
-    return log_Z_star_from_sizes([len(b) for b in blocks], theta, None, tie_penalty)
+def log_Z_star(blocks: List[List[int]], theta: float) -> float:
+    return log_Z_star_from_sizes([len(b) for b in blocks], theta)
 
 
 def log_py_eppf_from_sizes(sizes: List[int], gamma: float, delta: float) -> float:
@@ -108,13 +104,18 @@ def log_blocks_posterior(
     blocks_old: Optional[List[List[int]]] = None,
     distance_calculator=None,
     parallel: bool = False,
-    tie_penalty: float = 0.5,
+    use_py_prior: bool = True,
+    include_order_prior: bool = True,
 ) -> float:
     """Compute log posterior of blocks given cluster rankings.
 
     The ``blocks_old``, ``distance_calculator``, and ``parallel`` parameters
     are accepted for backward compatibility with legacy code but are ignored;
     the full distance is always computed via ``total_distance_fast``.
+
+    Note: the tie penalty p cancels analytically between the distance
+    d(r, rho_B) and the normalisation constant Z*, so it does not appear
+    in this function.
     """
     if not rankings_c:
         return float("-inf")
@@ -127,21 +128,25 @@ def log_blocks_posterior(
 
     if profiler:
         t_start = time.time()
-    S = total_distance_fast(rankings_c, blocks, tie_penalty=tie_penalty)
+    S = total_distance_fast(rankings_c, blocks)
     if profiler:
         profiler.record_operation("distance_calculation", time.time() - t_start)
 
     if profiler:
         t_start = time.time()
-    logZ = log_Z_star_from_sizes(sizes, theta, None, tie_penalty)
+    logZ = log_Z_star_from_sizes(sizes, theta)
     if profiler:
         profiler.record_operation("z_star_calculation", time.time() - t_start)
 
     if profiler:
         t_start = time.time()
-    logpy = log_py_eppf_from_sizes(sizes, gamma, delta)
+    if use_py_prior:
+        logpy = log_py_eppf_from_sizes(sizes, gamma, delta)
+    else:
+        logpy = 0.0
     if profiler:
         profiler.record_operation("py_prior_calculation", time.time() - t_start)
 
-    return (-theta * S) - (len(rankings_c) * logZ) + logpy - math.lgamma(K + 1)
+    log_ord = math.lgamma(K + 1) if include_order_prior else 0.0
+    return (-theta * S) - (len(rankings_c) * logZ) + logpy - log_ord
 

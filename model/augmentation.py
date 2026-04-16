@@ -17,9 +17,19 @@ are ``0..n-1``.  A **partial ranking** lists only the items that were
 actually observed, in order.  Its length is ``< n``.  The "missing" items
 are those in ``set(range(n)) - set(ranking)``.
 
-At initialisation the partial rankings are padded to length ``n`` by
-appending the missing items in a random order.  The augmentation MH step
-then explores alternative completions.
+At initialisation the partial rankings are completed according to one of
+two semantics:
+
+``top_k``
+    The observed items are treated as a fixed top-k prefix. Missing items are
+    appended after the observed prefix in random order, and MH only permutes
+    the missing tail.
+
+``subset``
+    The observed items are treated as an ordered subset. A completion is a
+    random linear extension that preserves only the observed relative order;
+    missing items may appear anywhere. MH then explores the space of such
+    linear extensions via adjacent swaps that keep the observed order intact.
 """
 
 import math
@@ -44,6 +54,7 @@ class PartialRankingInfo:
 
     # Per-assessor info (length N; entries are empty for complete rankings)
     missing_items: List[List[int]]       # missing_items[i] = list of unranked items
+    missing_item_sets: List[Set[int]]    # same info as sets for O(1) lookup
     observed_length: List[int]           # how many items were actually observed
     partial_mask: np.ndarray             # bool (N,): True if ranking i is partial
 
@@ -66,6 +77,7 @@ def detect_missing(rankings: List[List[int]], n: int) -> PartialRankingInfo:
     """
     N = len(rankings)
     missing_items: List[List[int]] = []
+    missing_item_sets: List[Set[int]] = []
     observed_length: List[int] = []
     partial_mask = np.zeros(N, dtype=bool)
 
@@ -76,18 +88,47 @@ def detect_missing(rankings: List[List[int]], n: int) -> PartialRankingInfo:
             present = set(r)
             miss = sorted(set(range(n)) - present)
             missing_items.append(miss)
+            missing_item_sets.append(set(miss))
             partial_mask[i] = True
         else:
             missing_items.append([])
+            missing_item_sets.append(set())
 
     n_partial = int(partial_mask.sum())
     return PartialRankingInfo(
         has_missing=(n_partial > 0),
         n_partial=n_partial,
         missing_items=missing_items,
+        missing_item_sets=missing_item_sets,
         observed_length=observed_length,
         partial_mask=partial_mask,
     )
+
+
+def _random_linear_extension(
+    observed_items: List[int],
+    missing_items: List[int],
+    n: int,
+    rng: random.Random,
+) -> List[int]:
+    """Sample a random completion that preserves the observed relative order."""
+    observed_positions = sorted(rng.sample(range(n), len(observed_items)))
+    missing_perm = missing_items[:]
+    rng.shuffle(missing_perm)
+
+    completed = [0] * n
+    observed_pos_set = set(observed_positions)
+
+    obs_idx = 0
+    miss_idx = 0
+    for pos in range(n):
+        if pos in observed_pos_set:
+            completed[pos] = observed_items[obs_idx]
+            obs_idx += 1
+        else:
+            completed[pos] = missing_perm[miss_idx]
+            miss_idx += 1
+    return completed
 
 
 def complete_rankings(
@@ -95,18 +136,25 @@ def complete_rankings(
     info: PartialRankingInfo,
     n: int,
     rng: random.Random,
+    partial_mode: str = "subset",
 ) -> List[List[int]]:
-    """Pad partial rankings to length n by appending missing items in random order.
+    """Complete partial rankings to length n under the selected semantics.
 
     Returns a new list of rankings (complete copies).  Rankings that are
     already complete are copied as-is.
     """
+    if partial_mode not in {"top_k", "subset"}:
+        raise ValueError("partial_mode must be either 'top_k' or 'subset'")
+
     completed = []
     for i, r in enumerate(rankings):
         if info.partial_mask[i]:
             miss = info.missing_items[i][:]
-            rng.shuffle(miss)
-            completed.append(list(r) + miss)
+            if partial_mode == "top_k":
+                rng.shuffle(miss)
+                completed.append(list(r) + miss)
+            else:
+                completed.append(_random_linear_extension(list(r), miss, n, rng))
         else:
             completed.append(list(r))
     return completed
@@ -150,7 +198,6 @@ def update_U_rows(
 
 def _swap_two_missing(
     ranking: List[int],
-    missing_items: List[int],
     observed_length: int,
     n: int,
     rng: random.Random,
@@ -184,9 +231,7 @@ def _log_mallows_kernel(
     ranking: List[int],
     block_idx: List[int],
     K: int,
-    Tm: int,
     theta: float,
-    tie_penalty: float,
 ) -> float:
     """Compute -theta * d(ranking, blocks) for a single ranking.
 
@@ -194,7 +239,34 @@ def _log_mallows_kernel(
     """
     from .distance import cross_block_disagreements_fast
     inv = cross_block_disagreements_fast(ranking, block_idx, K)
-    return -theta * (inv + tie_penalty * Tm)
+    return -theta * inv
+
+
+def _swap_subset_adjacent(
+    ranking: List[int],
+    missing_item_set: Set[int],
+    n: int,
+    rng: random.Random,
+) -> Tuple[List[int], int, int]:
+    """Propose a valid adjacent swap under the ordered-subset semantics.
+
+    We choose an adjacent pair uniformly from all ``n - 1`` positions.
+    Swapping is valid unless both items are observed, which would violate the
+    fixed observed relative order. Returning ``(-1, -1)`` denotes a null move.
+    """
+    if n < 2:
+        return ranking[:], -1, -1
+
+    p1 = rng.randint(0, n - 2)
+    p2 = p1 + 1
+    item1 = ranking[p1]
+    item2 = ranking[p2]
+    if item1 not in missing_item_set and item2 not in missing_item_set:
+        return ranking[:], -1, -1
+
+    proposed = ranking[:]
+    proposed[p1], proposed[p2] = proposed[p2], proposed[p1]
+    return proposed, p1, p2
 
 
 def _delta_inversions_swap(
@@ -277,16 +349,16 @@ def augmentation_mh_step(
     z: np.ndarray,
     clusters,  # List[ClusterParams]
     cache,     # List[_ClusterCache]
-    tie_penalty: float,
     rng: random.Random,
     n: int,
     method: str = "incremental",
+    partial_mode: str = "subset",
 ) -> Tuple[int, int]:
     """One sweep of MH augmentation over all partial assessors.
 
-    For each assessor with missing data, propose swapping two missing
-    items and accept/reject based on the Mallows likelihood under the
-    assessor's current cluster.
+    For each assessor with missing data, propose a semantics-preserving move
+    and accept/reject based on the Mallows likelihood under the assessor's
+    current cluster.
 
     Modifies ``rankings`` in-place for accepted proposals.
 
@@ -314,20 +386,29 @@ def augmentation_mh_step(
 
     use_incremental = method == "incremental"
 
+    if partial_mode not in {"top_k", "subset"}:
+        raise ValueError("partial_mode must be either 'top_k' or 'subset'")
+
     for i in partial_indices:
         obs_len = info.observed_length[i]
         n_miss = n - obs_len
-        if n_miss < 2:
+        if partial_mode == "top_k" and n_miss < 2:
+            continue
+        if partial_mode == "subset" and n_miss == 0:
             continue
 
         c = int(z[i])
         cl = clusters[c]
         cc = cache[c]
 
-        # Propose swap
-        proposed, p1, p2 = _swap_two_missing(
-            rankings[i], info.missing_items[i], obs_len, n, rng
-        )
+        if partial_mode == "top_k":
+            proposed, p1, p2 = _swap_two_missing(
+                rankings[i], obs_len, n, rng
+            )
+        else:
+            proposed, p1, p2 = _swap_subset_adjacent(
+                rankings[i], info.missing_item_sets[i], n, rng
+            )
         if p1 < 0:
             continue
 
@@ -341,10 +422,10 @@ def augmentation_mh_step(
         else:
             # O(n log K): full Fenwick for both
             log_cur = _log_mallows_kernel(
-                rankings[i], cc.block_idx, cc.K, cc.Tm, cl.theta, tie_penalty
+                rankings[i], cc.block_idx, cc.K, cl.theta
             )
             log_prop = _log_mallows_kernel(
-                proposed, cc.block_idx, cc.K, cc.Tm, cl.theta, tie_penalty
+                proposed, cc.block_idx, cc.K, cl.theta
             )
             log_acc = log_prop - log_cur
 

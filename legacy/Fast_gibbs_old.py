@@ -91,7 +91,7 @@ def fast_gibbs(rankings: List[List[int]],
         
         # Update the consensus ranking for cluster c 
         H[c] = np.sum([U_all[i] for i in range(N) if z[i] == c], axis=0) # total number of preferences of i over j in cluster c
-        Z_c = log_Z_star_from_sizes([len(b) for b in blocks_c], theta, tie_penalty=tie_penalty) # log Z* of cluster c from blocks
+        Z_c = log_Z_star_from_sizes([len(b) for b in blocks_c], theta) # log Z* of cluster c from blocks
         
         py_num = sum(np.log(gamma + i*delta) for i in range(1, K)) # log numerator of PY table term
         py_dom = sum(np.log(gamma + i) for i in range(1, n)) # log denominator

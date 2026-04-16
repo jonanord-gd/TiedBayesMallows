@@ -7,6 +7,16 @@ __pycache__/
 *.csv
 *.pkl
 *.soi
+*.png
+*.json
+*.pdf
+*.txt
+*.score
+*.order
+*.idata
+*.udata
+*.npy
+*.zip
 
 # Model run outputs
 **/runs/
@@ -19,3 +29,15 @@ movielens/ml-*/
 sport_power/baseball/
 sport_power/basketball/
 sport_power/football/
+block_merge_thresholds.png
+empirical_tie_threshold_test.png
+Formula_1_clustering.png
+prior_k_decomposition.png
+prior_k_effective.png
+prior_k_heatmap.png
+prior_k_py_only.png
+prior_k_vs_actual.png
+tie_threshold_data.png
+tie_threshold_pairs.png
+tie_threshold_verification_v2.png
+
