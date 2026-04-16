@@ -896,224 +896,6 @@ class MixtureRankingModel:
 
         return n_prop, n_acc
 
-    def _make_state_snapshot(self) -> Dict[str, Any]:
-        """Deep-ish copy of the current sampler state for safe proposal rollback."""
-        return {
-            "z": np.array(self.state.z, dtype=np.intp).copy(),
-            "tau": list(self.state.tau),
-            "clusters": [
-                ClusterParams(
-                    blocks=[b[:] for b in cl.blocks],
-                    theta=cl.theta,
-                    gamma=cl.gamma,
-                    delta=cl.delta,
-                )
-                for cl in self.state.clusters
-            ],
-            "zero_streak": list(self._zero_streak),
-            "dead_clusters": set(self._dead_clusters),
-        }
-
-    def _refresh_caches_after_global_state_change(self) -> None:
-        """Rebuild all cluster caches after a global state proposal."""
-        self._rebuild_all_cluster_caches()
-        self._D_cache = None
-        self._H_cache = None
-        self._M_dirty = [True] * self.C
-
-    def _restore_state_snapshot(self, snap: Dict[str, Any]) -> None:
-        """Restore a previously snapshotted state after a rejected proposal."""
-        self.state = MixtureState(
-            clusters=snap["clusters"],
-            z=np.array(snap["z"], dtype=np.intp),
-            tau=list(snap["tau"]),
-        )
-        self._zero_streak = list(snap["zero_streak"])
-        self._dead_clusters = set(snap["dead_clusters"])
-        self._refresh_caches_after_global_state_change()
-
-    def _set_tau_from_assignments(self) -> None:
-        """Deterministic positive tau update used inside split-merge proposals."""
-        counts = np.bincount(self.state.z, minlength=self.C).astype(np.float64)
-        prior = np.asarray(self.init_mu, dtype=np.float64)
-        weights = counts + np.maximum(prior, 1e-6)
-        total = float(weights.sum())
-        if total <= 0:
-            self.state.tau = [1.0 / self.C] * self.C
-        else:
-            self.state.tau = (weights / total).tolist()
-
-    @staticmethod
-    def _singleton_blocks_from_ranking(ranking: List[int]) -> List[List[int]]:
-        return [[int(item)] for item in ranking]
-
-    def _propose_merge_clusters(self, c_a: int, c_b: int) -> Optional[List[int]]:
-        """Merge two occupied clusters into one, keeping the better consensus."""
-        if c_a == c_b:
-            return None
-
-        counts = np.bincount(self.state.z, minlength=self.C)
-        if counts[c_a] <= 0 or counts[c_b] <= 0:
-            return None
-
-        c_keep, c_drop = (c_a, c_b) if counts[c_a] >= counts[c_b] else (c_b, c_a)
-        merge_mask = (self.state.z == c_keep) | (self.state.z == c_drop)
-        merge_idx = np.where(merge_mask)[0]
-        rankings_merge = [self.rankings[i] for i in merge_idx]
-
-        keep_cl = self.state.clusters[c_keep]
-        drop_cl = self.state.clusters[c_drop]
-        score_keep = total_distance_fast(rankings_merge, keep_cl.blocks)
-        score_drop = total_distance_fast(rankings_merge, drop_cl.blocks)
-        if score_drop < score_keep:
-            keep_cl.blocks = [b[:] for b in drop_cl.blocks]
-
-        w_keep = max(1, int(counts[c_keep]))
-        w_drop = max(1, int(counts[c_drop]))
-        keep_cl.theta = max(
-            1e-6,
-            (w_keep * keep_cl.theta + w_drop * drop_cl.theta) / (w_keep + w_drop),
-        )
-
-        self.state.z[merge_mask] = c_keep
-        self._dead_clusters.discard(c_keep)
-        self._dead_clusters.discard(c_drop)
-        self._zero_streak[c_keep] = 0
-        self._zero_streak[c_drop] = 0
-        self._set_tau_from_assignments()
-        return [c_keep, c_drop]
-
-    def _propose_split_cluster(
-        self,
-        c_source: int,
-        i_anchor: int,
-        j_anchor: int,
-    ) -> Optional[List[int]]:
-        """Split one occupied cluster into two using two anchor assessors."""
-        counts = np.bincount(self.state.z, minlength=self.C)
-        if counts[c_source] < max(2, int(self.cfg.split_merge_min_size)):
-            return None
-
-        empty_clusters = [
-            c for c in range(self.C)
-            if c != c_source and counts[c] == 0
-        ]
-        if not empty_clusters:
-            return None
-        empty_clusters.sort(key=lambda c: (c not in self._dead_clusters, c))
-        c_new = empty_clusters[0]
-
-        members = np.where(self.state.z == c_source)[0]
-        if i_anchor not in members or j_anchor not in members or i_anchor == j_anchor:
-            return None
-
-        blocks_left = self._singleton_blocks_from_ranking(self.rankings[i_anchor])
-        blocks_right = self._singleton_blocks_from_ranking(self.rankings[j_anchor])
-
-        z_new = np.array(self.state.z, dtype=np.intp).copy()
-        z_new[j_anchor] = c_new
-        for idx in members:
-            if idx == i_anchor:
-                z_new[idx] = c_source
-                continue
-            if idx == j_anchor:
-                z_new[idx] = c_new
-                continue
-
-            d_left = total_distance_fast([self.rankings[idx]], blocks_left)
-            d_right = total_distance_fast([self.rankings[idx]], blocks_right)
-            if d_right < d_left or (d_right == d_left and self.rng.random() < 0.5):
-                z_new[idx] = c_new
-            else:
-                z_new[idx] = c_source
-
-        left_n = int(np.sum(z_new[members] == c_source))
-        right_n = int(np.sum(z_new[members] == c_new))
-        if left_n == 0 or right_n == 0:
-            return None
-
-        self.state.z = z_new
-        source_cl = self.state.clusters[c_source]
-        target_cl = self.state.clusters[c_new]
-        source_theta = source_cl.theta
-
-        source_cl.blocks = blocks_left
-        target_cl.blocks = blocks_right
-        target_cl.theta = max(1e-6, source_theta * math.exp(self.rng.gauss(0.0, 0.05)))
-        target_cl.gamma = source_cl.gamma
-        target_cl.delta = source_cl.delta
-
-        self._dead_clusters.discard(c_source)
-        self._dead_clusters.discard(c_new)
-        self._zero_streak[c_source] = 0
-        self._zero_streak[c_new] = 0
-        self._set_tau_from_assignments()
-        return [c_source, c_new]
-
-    def _maybe_split_merge_move(self) -> Tuple[int, int]:
-        """Optional exploratory split-merge rescue move for assessor clusters.
-
-        This move is disabled by default. When enabled, it proposes either:
-        - a merge of two occupied clusters chosen by anchor assessors, or
-        - a split of one occupied cluster into an empty slot.
-
-        Rejected proposals are rolled back exactly, so the feature is safe to
-        switch on and off during experimentation.
-        """
-        cfg = self.cfg
-        if (not cfg.use_split_merge) or self.C < 2 or self.N < 2:
-            return 0, 0
-        if self.rng.random() >= float(cfg.split_merge_prob):
-            return 0, 0
-
-        active_idx = [i for i in range(self.N) if int(self.state.z[i]) not in self._dead_clusters]
-        if len(active_idx) < 2:
-            return 0, 0
-
-        i_anchor, j_anchor = self.rng.sample(active_idx, 2)
-        c_i = int(self.state.z[i_anchor])
-        c_j = int(self.state.z[j_anchor])
-
-        old_lp = self.log_joint()
-        snapshot = self._make_state_snapshot()
-
-        try:
-            if c_i == c_j:
-                affected = self._propose_split_cluster(c_i, i_anchor, j_anchor)
-            else:
-                affected = self._propose_merge_clusters(c_i, c_j)
-
-            if not affected:
-                return 0, 0
-
-            self._refresh_caches_after_global_state_change()
-
-            bootstrap_moves = max(0, int(cfg.split_merge_bootstrap_moves))
-            if bootstrap_moves > 0:
-                for c in affected:
-                    Rc = [r for r, zi in zip(self.rankings, self.state.z) if zi == c]
-                    if Rc:
-                        self._update_cluster_blocks(
-                            c,
-                            Rc,
-                            n_item_moves=bootstrap_moves,
-                            gamma=cfg.gamma,
-                            delta=cfg.delta,
-                        )
-                self._refresh_caches_after_global_state_change()
-
-            new_lp = self.log_joint()
-            log_acc = min(0.0, new_lp - old_lp)
-            accepted = math.log(max(self.rng.random(), 1e-300)) < log_acc
-        except Exception:
-            accepted = False
-
-        if not accepted:
-            self._restore_state_snapshot(snapshot)
-            return 1, 0
-
-        return 1, 1
-
     # -----------------------
     # public API
     # -----------------------
@@ -1184,15 +966,6 @@ class MixtureRankingModel:
         if profiler:
             profiler.record_stage("update_tau", time.time() - t_start)
 
-        # Optional global rescue move: occasionally split or merge clusters.
-        t_start = time.time()
-        split_merge_proposals, split_merge_accepts = self._maybe_split_merge_move()
-        if profiler and split_merge_proposals > 0:
-            profiler.record_stage("split_merge", time.time() - t_start)
-
-        # state.z may have changed after split-merge; refresh cached reference.
-        state_z = self.state.z
-
         theta_accepts: List[int] = [0] * C
         block_accepts: List[int] = [0] * C
         theta_proposals: List[int] = [0] * C
@@ -1254,8 +1027,6 @@ class MixtureRankingModel:
             "theta_accept_counts": theta_accept_counts,
             "block_proposals": block_proposals,
             "block_accept_counts": block_accept_counts,
-            "split_merge_proposals": split_merge_proposals,
-            "split_merge_accept_counts": split_merge_accepts,
             "aug_proposals": aug_proposals,
             "aug_accepts": aug_accepts,
         }
@@ -1420,8 +1191,6 @@ class MixtureRankingModel:
                 theta_accept_counts = [] if save_acceptance_details else None,
                 block_proposals = [] if save_acceptance_details else None,
                 block_accept_counts = [] if save_acceptance_details else None,
-                split_merge_proposals = [],
-                split_merge_accept_counts = [],
             )
 
         def snapshot() -> None:
@@ -1452,8 +1221,6 @@ class MixtureRankingModel:
         block_proposals_per_cluster = [0] * self.C
         aug_proposals_total = 0
         aug_accepts_total = 0
-        split_merge_proposals_total = 0
-        split_merge_accepts_total = 0
 
         # Adaptive theta step size (Robbins-Monro) during burn-in
         adapt_theta = self.cfg.adapt_theta_step and burn_in > 0
@@ -1502,8 +1269,6 @@ class MixtureRankingModel:
                 block_proposals_per_cluster[c] += info.get("block_proposals", [0]*self.C)[c]
             aug_proposals_total += info.get("aug_proposals", 0)
             aug_accepts_total += info.get("aug_accepts", 0)
-            split_merge_proposals_total += info.get("split_merge_proposals", 0)
-            split_merge_accepts_total += info.get("split_merge_accept_counts", 0)
             
             if save_samples and it >= burn_in and ((it - burn_in) % thin == 0):
                 snapshot()
@@ -1512,10 +1277,6 @@ class MixtureRankingModel:
                     samples.saved_iterations.append(it)
                 samples.theta_accepts.append(info["theta_accepts"])
                 samples.block_accepts.append(info["block_accepts"])
-                if samples.split_merge_proposals is not None:
-                    samples.split_merge_proposals.append(int(info.get("split_merge_proposals", 0)))
-                if samples.split_merge_accept_counts is not None:
-                    samples.split_merge_accept_counts.append(int(info.get("split_merge_accept_counts", 0)))
                 if save_acceptance_details:
                     if samples.theta_proposals is not None:
                         samples.theta_proposals.append(info.get("theta_proposals", [0]*self.C))
@@ -1559,10 +1320,6 @@ class MixtureRankingModel:
                 print(f"[MCMC] Adapted theta step sizes (target acceptance={target_acc:.3f}):")
                 for c in range(self.C):
                     print(f"  Cluster {c}: {self._theta_steps[c]:.4f} (was {self.cfg.theta_step:.4f})")
-            if split_merge_proposals_total > 0:
-                sm_rate = split_merge_accepts_total / split_merge_proposals_total
-                print(f"[MCMC] Split-merge acceptance: {sm_rate:.1%} "
-                      f"({split_merge_accepts_total}/{split_merge_proposals_total})")
             if self._partial_info.has_missing and aug_proposals_total > 0:
                 aug_rate = aug_accepts_total / aug_proposals_total
                 print(f"[MCMC] Augmentation acceptance: {aug_rate:.1%} "

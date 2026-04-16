@@ -37,8 +37,6 @@ class MCMCSamples:
     theta_accept_counts: Optional[List[List[int]]] = None
     block_proposals: Optional[List[List[int]]] = None
     block_accept_counts: Optional[List[List[int]]] = None
-    split_merge_proposals: Optional[List[int]] = None
-    split_merge_accept_counts: Optional[List[int]] = None
 
 
 @dataclass
@@ -53,13 +51,6 @@ class SamplerConfig:
     # Whether to use Pitman-Yor prior on block structure.
     # When False, a flat (non-informative) prior on partitions is used instead.
     use_py_prior: bool = True
-
-    # Optional global split-merge rescue move for assessor clusters.
-    # Disabled by default so the original sampler behaviour is unchanged.
-    use_split_merge: bool = False
-    split_merge_prob: float = 0.05
-    split_merge_bootstrap_moves: int = 1
-    split_merge_min_size: int = 4
 
     # Metropolis-Hastings parameters for updating theta
     a_theta: float = 2.0            # shape of Gamma prior on theta

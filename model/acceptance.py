@@ -163,18 +163,6 @@ def acceptance_probabilities(
                 "n_iterations": T_blk,
             }
 
-    if getattr(samples, "split_merge_proposals", None) is not None and getattr(samples, "split_merge_accept_counts", None) is not None:
-        Tsm = len(samples.split_merge_proposals)
-        if Tsm > 0:
-            n_props = sum(samples.split_merge_proposals)
-            n_accepts = sum(samples.split_merge_accept_counts)
-            results["split_merge"] = {
-                "n_proposals": n_props,
-                "n_accepts": n_accepts,
-                "acceptance_rate": (n_accepts / n_props) if n_props > 0 else None,
-                "n_iterations": Tsm,
-            }
-
     # Fallback: logp-based improvement heuristic (less specific)
     if samples.logp is not None and len(samples.logp) >= 2:
         logp_trace = samples.logp
@@ -226,23 +214,7 @@ def acceptance_probabilities(
                 "note": "Gibbs moves are always accepted by definition (collapsed Gibbs sampling)"
             }
         
-        elif parameter_lower == "split_merge":
-            if "split_merge" in results:
-                sm = results["split_merge"]
-                return {
-                    "parameter": "split_merge",
-                    "n_proposals": sm.get("n_proposals", 0),
-                    "n_accepts": sm.get("n_accepts", 0),
-                    "acceptance_rate": sm.get("acceptance_rate"),
-                    "n_iterations": sm.get("n_iterations"),
-                }
-            return {
-                "parameter": "split_merge",
-                "status": "not used in this run",
-                "note": "Enable use_split_merge=True to collect split-merge acceptance data."
-            }
-
-        elif parameter_lower in ["item_transfer", "ordering"]:
+        elif parameter_lower in ["split_merge", "item_transfer", "ordering"]:
             return {
                 "parameter": parameter_lower,
                 "status": "detailed tracking not available",
@@ -310,12 +282,6 @@ def print_acceptance_summary(
             print(f"  Mean across clusters: {mean_blk:.2%}")
         else:
             print("  Mean across clusters: N/A")
-
-    if "split_merge" in stats:
-        sm = stats["split_merge"]
-        ar = sm.get("acceptance_rate")
-        ar_str = f"{ar:.2%}" if ar is not None else "N/A"
-        print(f"\nSplit-merge moves: {sm.get('n_accepts', 0)}/{sm.get('n_proposals', 0)} accepts, acceptance_rate={ar_str}")
 
     # Theta acceptance
     if "theta" in stats:
