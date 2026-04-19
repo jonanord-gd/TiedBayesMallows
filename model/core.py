@@ -24,7 +24,7 @@ from .summaries import (
     estimate_z_from_frequency,
     summarize_theta,
 )
-from .utils import dirichlet_sample, sample_categorical_from_logweights
+from .utils import dirichlet_sample, normalize_simplex, sample_categorical_from_logweights
 from .blocks import blocks_to_block_index
 from .distance import total_distance_fast
 from .priors import log_Z_star_from_sizes, log_py_eppf_from_sizes, log_blocks_posterior
@@ -60,7 +60,7 @@ class MixtureRankingModel:
     Single entry-point object for TiedMallows MCMC:
       - initialize(...)
       - run_mcmc(...)
-      - estimate_map(...)
+      - find_map(...)
     Includes lightweight caches so we don't rebuild block indices / T(m) repeatedly.
     """
 
@@ -107,7 +107,7 @@ class MixtureRankingModel:
             Dirichlet prior parameters for the cluster weights. If omitted a
             symmetric prior with all entries 1.0 is used.
         init_z : list of int, optional
-            Initial cluster assignments for each ranking (z[i] = cluster for ranking i).
+            Initial cluster assignments for each ranking (z[i] = cluster for assessor i).
             If provided, tau is derived from the frequency of assignments in z.
             If omitted, z is randomly assigned and tau is sampled from Dirichlet.
             
@@ -268,7 +268,9 @@ class MixtureRankingModel:
             # Random initialization
             z0 = [self.rng.randrange(self.C) for _ in range(self.N)]
             tau0 = dirichlet_sample(self.init_mu, self.rng)
-        
+
+        tau0 = normalize_simplex(tau0)
+
         self.state = MixtureState(clusters=init_clusters, z=np.array(z0, dtype=np.intp), tau=tau0)
 
         # per-cluster caches (updated when blocks change)
@@ -466,7 +468,7 @@ class MixtureRankingModel:
 
     def _apply_incremental_D_update(
         self, c: int, moved_item: int,
-        old_block_idx, new_block_idx,
+        new_block_idx,
     ) -> None:
         """Incrementally update ``D_cache[:, c]`` and ``M[c]`` after one item moved.
 
@@ -540,7 +542,9 @@ class MixtureRankingModel:
         cache = self._cache
 
         # Per-cluster scalars (computed once per iteration)
-        log_tau = np.log(np.asarray(state.tau, dtype=np.float64))
+        tau_arr = np.asarray(normalize_simplex(state.tau), dtype=np.float64)
+        state.tau = tau_arr.tolist()
+        log_tau = np.log(np.clip(tau_arr, np.finfo(np.float64).tiny, None))
         thetas = np.array([state.clusters[c].theta for c in range(C)])
 
         # Cache q-factorials: rebuild only when theta changes
@@ -675,7 +679,7 @@ class MixtureRankingModel:
 
         counts = np.bincount(state.z, minlength=C)
         post = [init_mu[c] + int(counts[c]) for c in range(C)]
-        state.tau = dirichlet_sample(post, rng)
+        state.tau = normalize_simplex(dirichlet_sample(post, rng))
 
         # ── Collapse detection ────────────────────────────────────────────────
         # Update zero-streak counters; permanently retire clusters that have
@@ -829,7 +833,7 @@ class MixtureRankingModel:
                 new_block_idx = blocks_to_block_index(
                     out_blocks, self.n, validate=False)
                 self._apply_incremental_D_update(
-                    c, moved_item, current_block_idx, new_block_idx)
+                    c, moved_item, new_block_idx)
                 current_block_idx = new_block_idx
             else:
                 # Blocks may have changed even when D_cache is None;
@@ -1349,89 +1353,80 @@ class MixtureRankingModel:
         *,
         ci: float = 0.95
     ) -> Dict[str, Any]:
-        """Frequency MAP-like summaries (no label switching handling)."""
-        if samples is None:
-            if self.samples is None:
-                raise RuntimeError("No samples available. Run run_mcmc(...) first with save_samples=True.")
-            samples = self.samples
-
-        z_samples = samples.z_samples
-        blocks_samples = samples.blocks_samples
-        if not z_samples or not blocks_samples:
-            raise ValueError("Need z_samples and blocks_samples")
-
-        out: Dict[str, Any] = {}
-        out["N"] = len(z_samples[0])
-        out["C"] = self.C
-        out["T"] = len(z_samples)
-
-        out["labels"] = estimate_z_from_frequency(z_samples, C=self.C)
-
-        consensus_blocks = []
-        for c in range(self.C):
-            counts: Dict[Tuple[Tuple[int, ...], ...], int] = {}
-            for t in range(len(z_samples)):
-                key = _canonicalize_blocks(blocks_samples[t][c])
-                counts[key] = counts.get(key, 0) + 1
-            mode_key, mode_prob, mode_count = _posterior_mode_from_counts(counts)
-            blocks_hat = [list(block) for block in mode_key]
-            consensus_blocks.append({
-                "cluster": c,
-                "blocks_hat": blocks_hat,
-                "posterior_prob": mode_prob,
-                "count": mode_count,
-                "n_unique": len(counts),
-            })
-        out["consensus_blocks"] = consensus_blocks
-
-        if samples.theta_samples is not None:
-            theta_summary = []
-            for c in range(self.C):
-                theta_c = [samples.theta_samples[t][c] for t in range(len(z_samples))]
-                theta_summary.append({"cluster": c, **summarize_theta(theta_c, ci=ci)})
-            out["theta_summary"] = theta_summary
-        else:
-            out["theta_summary"] = None
-
-        return out
+        """Deprecated. Use find_map(method='frequency') instead."""
+        import warnings
+        warnings.warn(
+            "estimate_map() is deprecated and will be removed in a future version. "
+            "Use find_map(method='frequency', ci=...) instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.find_map(samples, method="frequency", ci=ci)
 
     def find_map(
         self,
         samples: Optional[MCMCSamples] = None,
         *,
+        method: str = "logp",
         refine: bool = True,
         max_sweeps: int = 50,
+        ci: float = 0.95,
         verbose: bool = True,
     ) -> Dict[str, Any]:
-        """Find the MAP state from the MCMC chain and optionally refine with ICM.
+        """Find the MAP estimate from the MCMC chain.
 
-        1. Recover the state with the highest ``log_joint`` from saved samples.
-        2. (Optional) Run Iterated Conditional Modes (ICM) sweeps on the block
-           structures — deterministic hill-climbing that reuses the fast
-           H-vector + prefix-sum machinery from the Gibbs sampler.
+        Two methods are available via the ``method`` parameter:
+
+        ``method='logp'`` (default)
+            Selects the sample with the highest log-joint probability and
+            optionally refines it with Iterated Conditional Modes (ICM) — a
+            deterministic hill-climbing pass that can further improve the
+            log-joint beyond any visited sample.
+
+            Returns a dict with keys:
+                ``best_t``       – index of the best sample in the chain
+                ``logp_chain``   – log-joint of the best sample (before refinement)
+                ``logp_refined`` – log-joint after ICM refinement
+                ``z``            – cluster assignments at the MAP
+                ``tau``          – mixture weights at the MAP
+                ``clusters``     – list of dicts per cluster, each with
+                                   ``blocks``, ``theta``, ``icm_moves``, ``icm_sweeps``
+
+        ``method='frequency'``
+            Finds the most *frequently visited* block partition across the
+            post-burn-in chain (the posterior mode by count) and summarises θ
+            as a posterior mean/credible interval. Equivalent to the old
+            ``estimate_map()`` call; primarily useful as a diagnostic to compare
+            against the ``logp`` result.
+
+            Returns a dict with keys:
+                ``N``, ``C``, ``T``     – data/model/chain dimensions
+                ``labels``              – frequency-based cluster assignments
+                ``consensus_blocks``    – list of dicts per cluster with
+                                         ``blocks_hat``, ``posterior_prob``,
+                                         ``count``, ``n_unique``
+                ``theta_summary``       – list of dicts per cluster with
+                                         posterior mean and credible interval
 
         Parameters
         ----------
         samples : MCMCSamples, optional
             If None, uses ``self.samples``.
+        method : str
+            ``'logp'`` (default) or ``'frequency'``.
         refine : bool
-            If True (default), run ICM sweeps after recovering the best sample.
+            ``logp`` only. If True (default), run ICM after recovering the best sample.
         max_sweeps : int
-            Maximum number of ICM sweeps per cluster (stops early on convergence).
+            ``logp`` only. Maximum ICM sweeps per cluster.
+        ci : float
+            ``frequency`` only. Credible interval width for theta summary.
         verbose : bool
-            Print progress information.
-
-        Returns
-        -------
-        dict with keys:
-            ``best_t``          – index of the best sample in the chain
-            ``logp_chain``      – log-joint of the best sample (before refinement)
-            ``logp_refined``    – log-joint after ICM refinement (if refine=True)
-            ``z``               – cluster assignments
-            ``tau``             – mixture weights
-            ``clusters``        – list of dicts per cluster with ``blocks``, ``theta``,
-                                  ``icm_moves``, ``icm_sweeps``
+            ``logp`` only. Print progress.
         """
+        if method == "frequency":
+            return self._find_map_frequency(samples, ci=ci)
+        if method != "logp":
+            raise ValueError(f"method must be 'logp' or 'frequency', got {method!r}")
         if samples is None:
             if self.samples is None:
                 raise RuntimeError("No samples. Run run_mcmc(save_samples=True) first.")
@@ -1564,6 +1559,58 @@ class MixtureRankingModel:
         for c in range(self.C):
             self._rebuild_cluster_cache(c)
         self._M_dirty = [True] * self.C
+
+        return out
+
+    def _find_map_frequency(
+        self,
+        samples: Optional[MCMCSamples],
+        *,
+        ci: float = 0.95,
+    ) -> Dict[str, Any]:
+        """Frequency-based MAP (posterior mode by count). Called by find_map(method='frequency')."""
+        if samples is None:
+            if self.samples is None:
+                raise RuntimeError("No samples available. Run run_mcmc(...) first with save_samples=True.")
+            samples = self.samples
+
+        z_samples = samples.z_samples
+        blocks_samples = samples.blocks_samples
+        if not z_samples or not blocks_samples:
+            raise ValueError("Need z_samples and blocks_samples")
+
+        out: Dict[str, Any] = {}
+        out["N"] = len(z_samples[0])
+        out["C"] = self.C
+        out["T"] = len(z_samples)
+
+        out["labels"] = estimate_z_from_frequency(z_samples, C=self.C)
+
+        consensus_blocks = []
+        for c in range(self.C):
+            counts: Dict[Tuple[Tuple[int, ...], ...], int] = {}
+            for t in range(len(z_samples)):
+                key = _canonicalize_blocks(blocks_samples[t][c])
+                counts[key] = counts.get(key, 0) + 1
+            mode_key, mode_prob, mode_count = _posterior_mode_from_counts(counts)
+            blocks_hat = [list(block) for block in mode_key]
+            consensus_blocks.append({
+                "cluster": c,
+                "blocks_hat": blocks_hat,
+                "posterior_prob": mode_prob,
+                "count": mode_count,
+                "n_unique": len(counts),
+            })
+        out["consensus_blocks"] = consensus_blocks
+
+        if samples.theta_samples is not None:
+            theta_summary = []
+            for c in range(self.C):
+                theta_c = [samples.theta_samples[t][c] for t in range(len(z_samples))]
+                theta_summary.append({"cluster": c, **summarize_theta(theta_c, ci=ci)})
+            out["theta_summary"] = theta_summary
+        else:
+            out["theta_summary"] = None
 
         return out
 
