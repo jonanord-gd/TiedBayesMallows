@@ -16,6 +16,11 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
+try:
+    from scipy.special import gammaln as _vec_lgamma
+except ImportError:
+    _vec_lgamma = np.vectorize(math.lgamma)
+
 from .blocks import blocks_to_block_index
 from .priors import build_log_qfactorials
 from .utils import sample_categorical_from_logweights
@@ -275,11 +280,22 @@ def fast_gibbs_reassign_one_item(
     # Block sizes and a per-item block-index array for the base structure.
     # base_block_idx[l] is set to -1 as a sentinel (l is unplaced).
     base_sizes = [len(b) for b in base]
-    base_block_idx = np.empty(n, dtype=np.intp)
-    base_block_idx[l] = -1
-    for k, blk in enumerate(base):
-        for item in blk:
-            base_block_idx[item] = k
+    K = len(blocks)
+    # Fast path: derive base_block_idx from the passed-in block_index via numpy,
+    # avoiding the O(n) Python double for-loop.  block_index maps every item to
+    # its current block before item l was removed.
+    if block_index is not None:
+        block_idx_arr = np.asarray(block_index, dtype=np.intp)
+        base_block_idx = block_idx_arr.copy()
+        base_block_idx[l] = -1
+        if K_minus < K:  # block_l was a singleton and was dropped
+            base_block_idx[base_block_idx > block_l] -= 1
+    else:
+        base_block_idx = np.empty(n, dtype=np.intp)
+        base_block_idx[l] = -1
+        for k, blk in enumerate(base):
+            for item in blk:
+                base_block_idx[item] = k
 
     # ── Step 4: compute per-pair preference counts involving l ────────────────
     # For every other item x we need h_l_gt_x = #{assessors: pos(l) > pos(x)},
@@ -331,7 +347,6 @@ def fast_gibbs_reassign_one_item(
     if use_py_prior:
         # Denominator of the Pitman-Yor (PY) table prior: log[Γ(γ+n)/Γ(γ+1)]
         log_py_denom = lgamma(gamma + n) - lgamma(gamma + 1)
-
         # PY table-count factor for the base K_minus blocks:
         log_py_tables_base = sum(log(gamma + i * delta) for i in range(1, K_minus))
         # PY block-size factor:
@@ -340,46 +355,43 @@ def fast_gibbs_reassign_one_item(
     # Mallows normalisation base terms:
     base_logP = sum(lgamma(s + 1) for s in base_sizes)
     base_log_qf_sum = sum(log_qfact[s] for s in base_sizes)
+    log_qfact_arr = np.asarray(log_qfact)
+    sizes_arr = np.asarray(base_sizes, dtype=np.float64)
+    sizes_arr_int = sizes_arr.astype(np.intp)
 
-    # ── Step 7: "create" candidate log-weights ────────────────────────────────
+    # ── Step 7: "create" candidate log-weights (vectorised over K_minus+1 positions) ───
     # There are K_minus+1 positions where l can be inserted as a new singleton.
     if use_py_prior:
         log_py_create = (log_py_tables_base + log(gamma + K_minus * delta)
                          + log_py_sizes_base - log_py_denom)
     else:
         log_py_create = 0.0
-    log_Z_create = (base_logP
-                    + log_qfact[n] - base_log_qf_sum - log_qfact[1])
+    log_Z_create = base_logP + float(log_qfact_arr[n]) - base_log_qf_sum - float(log_qfact_arr[1])
     log_ord_create = -lgamma(K_minus + 2) if include_uniform_order_prior else 0.0
 
     lw_create_common = log_py_create + log_ord_create - N * log_Z_create
-    log_weights: List[float] = []
-    for p in range(K_minus + 1):
-        log_weights.append(lw_create_common - theta * (prefix_Hlt[p] + suffix_Hgt[p]))
+    lw_create = lw_create_common - theta * (prefix_Hlt + suffix_Hgt)  # (K_minus+1,)
 
-    # ── Step 8: "add" candidate log-weights ───────────────────────────────────
+    # ── Step 8: "add" candidate log-weights (vectorised over K_minus blocks) ──────────
     # There are K_minus candidates, one for each existing block l can join.
     if use_py_prior:
         log_py_add_common = log_py_tables_base + log_py_sizes_base - log_py_denom
     else:
         log_py_add_common = 0.0
-    log_Z_add_base = (base_logP
-                      + log_qfact[n] - base_log_qf_sum)
+    log_Z_add_base = base_logP + float(log_qfact_arr[n]) - base_log_qf_sum
     log_ord_add = -lgamma(K_minus + 1) if include_uniform_order_prior else 0.0
 
-    for k in range(K_minus):
-        s_k = base_sizes[k]
-        contrib_l = prefix_Hlt[k] + suffix_Hgt[k + 1]
-        if use_py_prior:
-            log_py_k = log_py_add_common + log(s_k - delta)
-        else:
-            log_py_k = 0.0
-        log_Z_k = (log_Z_add_base
-                   + log(s_k + 1) - (log_qfact[s_k + 1] - log_qfact[s_k]))
-        log_weights.append(log_py_k + log_ord_add - theta * contrib_l - N * log_Z_k)
+    contrib_l_arr = prefix_Hlt[:K_minus] + suffix_Hgt[1:]  # (K_minus,)
+    log_Z_add_arr = (log_Z_add_base + np.log(sizes_arr + 1)
+                     - (log_qfact_arr[sizes_arr_int + 1] - log_qfact_arr[sizes_arr_int]))
+    if use_py_prior:
+        lw_add = (log_py_add_common + np.log(sizes_arr - delta)
+                  + log_ord_add - theta * contrib_l_arr - N * log_Z_add_arr)
+    else:
+        lw_add = log_ord_add - theta * contrib_l_arr - N * log_Z_add_arr
 
     # ── Step 9: sample from the categorical distribution ──────────────────────
-    idx = sample_categorical_from_logweights(log_weights, rng)
+    idx = sample_categorical_from_logweights(np.concatenate([lw_create, lw_add]), rng)
 
     chosen = _build_candidate(base, l, idx, K_minus)
     return chosen, 1, 1, l
@@ -436,49 +448,50 @@ def _compute_item_logweights(
 
     q = math.exp(-theta)
     log_qfact = build_log_qfactorials(n, q)
-    if use_py_prior:
-        log_gamma_1md = lgamma(1.0 - delta)
-        log_py_denom = lgamma(gamma + n) - lgamma(gamma + 1)
-
-        log_py_tables_base = sum(log(gamma + i * delta) for i in range(1, K_minus))
-        log_py_sizes_base = sum(lgamma(s - delta) - log_gamma_1md for s in base_sizes)
+    log_qfact_arr = np.asarray(log_qfact)
+    sizes_arr = np.asarray(base_sizes, dtype=np.float64)
+    sizes_arr_int = sizes_arr.astype(np.intp)
 
     base_logP = sum(lgamma(s + 1) for s in base_sizes)
     base_log_qf_sum = sum(log_qfact[s] for s in base_sizes)
+
+    if use_py_prior:
+        log_gamma_1md = lgamma(1.0 - delta)
+        log_py_denom = lgamma(gamma + n) - lgamma(gamma + 1)
+        log_py_tables_base = (
+            float(np.log(gamma + np.arange(1, K_minus, dtype=np.float64) * delta).sum())
+            if K_minus > 1 else 0.0
+        )
+        log_py_sizes_base = sum(lgamma(s - delta) - log_gamma_1md for s in base_sizes)
 
     if use_py_prior:
         log_py_create = (log_py_tables_base + log(gamma + K_minus * delta)
                          + log_py_sizes_base - log_py_denom)
     else:
         log_py_create = 0.0
-    log_Z_create = (base_logP
-                    + log_qfact[n] - base_log_qf_sum - log_qfact[1])
+    log_Z_create = base_logP + float(log_qfact_arr[n]) - base_log_qf_sum - float(log_qfact_arr[1])
     log_ord_create = -lgamma(K_minus + 2) if include_uniform_order_prior else 0.0
 
     if use_py_prior:
         log_py_add_common = log_py_tables_base + log_py_sizes_base - log_py_denom
     else:
         log_py_add_common = 0.0
-    log_Z_add_base = (base_logP
-                      + log_qfact[n] - base_log_qf_sum)
+    log_Z_add_base = base_logP + float(log_qfact_arr[n]) - base_log_qf_sum
     log_ord_add = -lgamma(K_minus + 1) if include_uniform_order_prior else 0.0
 
-    log_weights: List[float] = []
     lw_create_common = log_py_create + log_ord_create - N * log_Z_create
-    for p in range(K_minus + 1):
-        log_weights.append(lw_create_common - theta * (prefix_Hlt[p] + suffix_Hgt[p]))
-    for k in range(K_minus):
-        s_k = base_sizes[k]
-        contrib_l = prefix_Hlt[k] + suffix_Hgt[k + 1]
-        if use_py_prior:
-            log_py_k = log_py_add_common + log(s_k - delta)
-        else:
-            log_py_k = 0.0
-        log_Z_k = (log_Z_add_base
-                   + log(s_k + 1) - (log_qfact[s_k + 1] - log_qfact[s_k]))
-        log_weights.append(log_py_k + log_ord_add - theta * contrib_l - N * log_Z_k)
+    lw_create = lw_create_common - theta * (prefix_Hlt + suffix_Hgt)  # (K_minus+1,)
 
-    return log_weights, base, K_minus
+    contrib_l_arr = prefix_Hlt[:K_minus] + suffix_Hgt[1:]  # (K_minus,)
+    log_Z_add_arr = (log_Z_add_base + np.log(sizes_arr + 1)
+                     - (log_qfact_arr[sizes_arr_int + 1] - log_qfact_arr[sizes_arr_int]))
+    if use_py_prior:
+        lw_add = (log_py_add_common + np.log(sizes_arr - delta)
+                  + log_ord_add - theta * contrib_l_arr - N * log_Z_add_arr)
+    else:
+        lw_add = log_ord_add - theta * contrib_l_arr - N * log_Z_add_arr
+
+    return np.concatenate([lw_create, lw_add]), base, K_minus
 
 
 def greedy_reassign_one_item(

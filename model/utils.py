@@ -9,24 +9,25 @@ import math
 import random
 from typing import List
 
+import numpy as np
 
-def logsumexp(logw: List[float]) -> float:
-    m = max(logw)
+
+def logsumexp(logw) -> float:
+    arr = np.asarray(logw, dtype=np.float64)
+    m = float(arr.max())
     if m == float("-inf"):
         return float("-inf")
-    return m + math.log(sum(math.exp(x - m) for x in logw))
+    return m + math.log(float(np.exp(arr - m).sum()))
 
 
-def sample_categorical_from_logweights(logw: List[float], rng: random.Random) -> int:
-    lse = logsumexp(logw)
-    probs = [math.exp(x - lse) for x in logw]
-    u = rng.random()
-    s = 0.0
-    for k, p in enumerate(probs):
-        s += p
-        if u <= s:
-            return k
-    return len(probs) - 1
+def sample_categorical_from_logweights(logw, rng: random.Random) -> int:
+    arr = np.asarray(logw, dtype=np.float64)
+    m = arr.max()
+    shifted = np.exp(arr - m)
+    cumprobs = np.cumsum(shifted)
+    u = rng.random() * float(cumprobs[-1])
+    idx = int(np.searchsorted(cumprobs, u))
+    return min(idx, len(arr) - 1)
 
 
 def normalize_simplex(values: List[float], min_value: float = 1e-300) -> List[float]:

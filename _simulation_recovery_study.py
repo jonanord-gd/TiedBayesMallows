@@ -36,6 +36,7 @@ import numpy as np
 
 from helper_functions.Generate_mixture_data import generate_mixture_data
 from model.TiedMallowsModel import MixtureRankingModel
+from model.initialization import init_spectral_with_z
 
 
 @dataclass(frozen=True)
@@ -112,6 +113,36 @@ def larger_grid_scenarios(include_c10: bool = False) -> list[Scenario]:
                             f"c{n_clusters}_n{n_assessors}_m{n_items}_bd{bd_str}_theta{str(theta).replace('.', 'p')}",
                             n_clusters, n_assessors, n_items, block_density, theta,
                         ))
+    return build_scenarios(base_specs, seeds=[101])
+
+
+def single_cluster_bd_scenarios() -> list[Scenario]:
+    """Single-cluster sweep over block_density.
+
+    Purpose: assess consensus recovery for C=1 as block density varies from
+    fully-tied (one big block, bd≈0) to strict (n_items singletons, bd=1).
+
+    block_density is kept as the design axis rather than a raw block count so
+    that results are comparable across different n_items values.
+
+    Axes:
+      - block_density : 0.00, 0.10, 0.20, 0.40, 0.60, 0.80, 1.00
+      - n_assessors   : 100, 300, 700
+      - n_items       : 10, 20, 50, 100
+      - theta         : 0.1, 0.5, 1.0, 3.0
+    """
+    BLOCK_DENSITIES = (0.00, 0.10, 0.20, 0.40, 0.60, 0.80, 1.00)
+    base_specs: list[tuple[str, int, int, int, float, float]] = []
+    for n_assessors in (100, 300, 700):
+        for n_items in (10, 20, 50, 100):
+            for block_density in BLOCK_DENSITIES:
+                bd_str = f"{block_density:.2f}".replace('.', 'p')
+                for theta in (0.1, 0.5, 1.0, 3.0):
+                    theta_str = str(theta).replace('.', 'p')
+                    base_specs.append((
+                        f"c1_n{n_assessors}_m{n_items}_bd{bd_str}_theta{theta_str}",
+                        1, n_assessors, n_items, block_density, theta,
+                    ))
     return build_scenarios(base_specs, seeds=[101])
 
 
@@ -395,6 +426,7 @@ def evaluate_recovery(
     map_result: dict[str, Any],
     n_true_clusters: int,
     n_items: int,
+    true_theta: float | None = None,
 ) -> dict[str, Any]:
     z_pred = map_result["z"]
     pred_blocks = [cluster["blocks"] for cluster in map_result["clusters"]]
@@ -405,6 +437,9 @@ def evaluate_recovery(
         z_true, z_pred, n_true_clusters, n_fit_clusters
     )
     ari = adjusted_rand_index(z_true, z_pred)
+    # For C=1 with a single predicted cluster, ARI is 0/0 → treat as perfect (1.0)
+    if n_true_clusters == 1 and n_pred_clusters == 1:
+        ari = 1.0
 
     per_cluster = []
     cluster_sizes = [sum(1 for z in z_true if z == c) for c in range(n_true_clusters)]
@@ -413,6 +448,9 @@ def evaluate_recovery(
     weighted_inversions = 0.0
     weighted_block_f1 = 0.0
     weighted_block_error = 0.0
+    weighted_block_signed_error = 0.0
+    weighted_block_ari = 0.0
+    weighted_theta_abs_error = 0.0
     total_weight = sum(cluster_sizes)
 
     true_to_pred = {true_label: pred_label for pred_label, true_label in pred_to_true.items()}
@@ -434,7 +472,11 @@ def evaluate_recovery(
                 "same_block_jaccard": 0.0,
             }
             block_error = float(len(true_consensus))
+            block_signed_error = -float(len(true_consensus))  # all blocks missing
+            block_ari = 0.0
             overlap = 0.0
+            pred_theta = float("nan")
+            theta_abs_error = float("nan")
         else:
             pred_consensus = pred_blocks[pred_cluster]
             kemeny = kemeny_p_half_weak_vs_weak(true_consensus, pred_consensus, n_items)
@@ -442,7 +484,14 @@ def evaluate_recovery(
             inversions = strict_inversion_count(true_consensus, pred_consensus, n_items)
             block_stats = same_block_pair_stats(true_consensus, pred_consensus, n_items)
             block_error = abs(len(true_consensus) - len(pred_consensus))
+            block_signed_error = float(len(pred_consensus) - len(true_consensus))
+            block_ari = adjusted_rand_index(
+                block_index(true_consensus, n_items),
+                block_index(pred_consensus, n_items),
+            )
             overlap = confusion[true_cluster][pred_cluster] / cluster_sizes[true_cluster] if cluster_sizes[true_cluster] else 0.0
+            pred_theta = float(map_result["clusters"][pred_cluster]["theta"])
+            theta_abs_error = abs(true_theta - pred_theta) if true_theta is not None else float("nan")
 
         weight = cluster_sizes[true_cluster] / total_weight if total_weight else 0.0
         weighted_kemeny += weight * kemeny
@@ -450,6 +499,10 @@ def evaluate_recovery(
         weighted_inversions += weight * inversions
         weighted_block_f1 += weight * block_stats["same_block_f1"]
         weighted_block_error += weight * block_error
+        weighted_block_signed_error += weight * block_signed_error
+        weighted_block_ari += weight * block_ari
+        if not math.isnan(theta_abs_error):
+            weighted_theta_abs_error += weight * theta_abs_error
 
         per_cluster.append({
             "true_cluster": true_cluster,
@@ -459,9 +512,13 @@ def evaluate_recovery(
             "true_n_blocks": len(true_consensus),
             "pred_n_blocks": len(pred_consensus),
             "block_count_abs_error": block_error,
+            "block_count_signed_error": block_signed_error,
+            "block_ari": block_ari,
             "kemeny_p_half": kemeny,
             "normalized_kemeny_p_half": normalized_kemeny,
             "strict_inversions": inversions,
+            "pred_theta": pred_theta,
+            "theta_abs_error": theta_abs_error,
             **block_stats,
             "true_blocks": true_consensus,
             "pred_blocks": pred_consensus,
@@ -475,6 +532,9 @@ def evaluate_recovery(
         "weighted_strict_inversions": weighted_inversions,
         "weighted_same_block_f1": weighted_block_f1,
         "weighted_block_count_error": weighted_block_error,
+        "weighted_block_count_signed_error": weighted_block_signed_error,
+        "weighted_block_ari": weighted_block_ari,
+        "weighted_theta_abs_error": weighted_theta_abs_error if true_theta is not None else float("nan"),
         "n_true_clusters": n_true_clusters,
         "n_pred_clusters": n_pred_clusters,
         "cluster_mapping_pred_to_true": pred_to_true,
@@ -527,6 +587,7 @@ def run_scenario(
         map_result=map_result,
         n_true_clusters=scenario.n_clusters,
         n_items=scenario.n_items,
+        true_theta=scenario.theta,
     )
     elapsed = time.time() - start
     return {
@@ -547,6 +608,165 @@ def run_scenario(
             "true_n_clusters": scenario.n_clusters,
             "fit_n_clusters": n_clusters_fit,
             "init_mu": init_mu,
+        },
+        "runtime_seconds": elapsed,
+        "tau_true": tau_true,
+        "z_true": z_true,
+        "true_blocks": true_blocks,
+        "map_result": {
+            "logp_chain": map_result["logp_chain"],
+            "logp_refined": map_result["logp_refined"],
+            "z": map_result["z"],
+            "tau": map_result["tau"],
+            "clusters": map_result["clusters"],
+            "restart_summaries": map_result["restart_summaries"],
+        },
+        "metrics": metrics,
+    }
+
+
+def fit_model_spectral_init(
+    rankings: list[list[int]],
+    n_clusters_fit: int,
+    n_iter: int,
+    burn_in: int,
+    thin: int,
+    seed: int,
+    n_restarts: int,
+    use_annealing: bool = True,
+    annealing_schedule_type: str = "linear",
+    annealing_plateau_frac: float = 0.5,
+    temp_min: float = 0.1,
+    temp_max: float = 1.0,
+) -> dict[str, Any]:
+    """Fit the model with spectral-clustering warm-start (Kendall-agreement affinity).
+
+    Uses ``init_spectral_with_z`` to build initial cluster assignments from the
+    rankings directly, then runs MCMC initialised at those assignments.  Restarts
+    re-draw the spectral init with a different random seed so each restart starts
+    from a slightly different spectral solution.
+    """
+    init_mu = init_mu_small(n_clusters_fit)
+    best_result: dict[str, Any] | None = None
+    restart_summaries: list[dict[str, Any]] = []
+    for restart in range(n_restarts):
+        restart_seed = seed + 1000 * restart
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            init_clusters, init_z = init_spectral_with_z(
+                rankings,
+                n_clusters_fit,
+                seed=restart_seed,
+                py_sampling=False,
+            )
+            model = MixtureRankingModel(
+                rankings,
+                init_clusters=init_clusters,
+                init_z=init_z,
+                init_mu=init_mu,
+                seed=restart_seed,
+                verbose=False,
+            )
+        _, samples = model.run_mcmc(
+            n_iter=n_iter,
+            burn_in=burn_in,
+            thin=thin,
+            save_samples=True,
+            save_tau=True,
+            save_theta=True,
+            save_logp=True,
+            use_py_prior=False,
+            include_order_prior=False,
+            use_annealing=use_annealing,
+            annealing_schedule_type=annealing_schedule_type,
+            annealing_plateau_frac=annealing_plateau_frac,
+            temp_min=temp_min,
+            temp_max=temp_max,
+        )
+        assert samples is not None
+        map_result = model.find_map(samples, refine=True, verbose=False)
+        restart_summaries.append({
+            "restart": restart,
+            "seed": restart_seed,
+            "n_clusters_fit": n_clusters_fit,
+            "init_mu_value": init_mu[0],
+            "logp_chain": map_result["logp_chain"],
+            "logp_refined": map_result["logp_refined"],
+        })
+        if best_result is None or map_result["logp_refined"] > best_result["logp_refined"]:
+            best_result = map_result
+
+    assert best_result is not None
+    best_result = dict(best_result)
+    best_result["restart_summaries"] = restart_summaries
+    return best_result
+
+
+def run_scenario_spectral_init(
+    scenario: Scenario,
+    *,
+    n_iter: int,
+    burn_in: int,
+    thin: int,
+    n_restarts: int,
+    use_annealing: bool = True,
+    annealing_schedule_type: str = "linear",
+    annealing_plateau_frac: float = 0.5,
+    temp_min: float = 0.1,
+    temp_max: float = 1.0,
+) -> dict[str, Any]:
+    """Same as ``run_scenario`` but uses spectral-clustering initialisation."""
+    start = time.time()
+    n_clusters_fit = fitted_cluster_count(scenario.n_clusters)
+    true_blocks, tau_true, z_true, rankings = generate_mixture_data(
+        n_assessors=scenario.n_assessors,
+        n_items=scenario.n_items,
+        C=scenario.n_clusters,
+        seed=scenario.seed,
+        theta=scenario.theta,
+        block_density=scenario.block_density,
+    )
+    map_result = fit_model_spectral_init(
+        rankings=rankings,
+        n_clusters_fit=n_clusters_fit,
+        n_iter=n_iter,
+        burn_in=burn_in,
+        thin=thin,
+        seed=scenario.seed,
+        n_restarts=n_restarts,
+        use_annealing=use_annealing,
+        annealing_schedule_type=annealing_schedule_type,
+        annealing_plateau_frac=annealing_plateau_frac,
+        temp_min=temp_min,
+        temp_max=temp_max,
+    )
+    metrics = evaluate_recovery(
+        true_blocks=true_blocks,
+        z_true=z_true,
+        map_result=map_result,
+        n_true_clusters=scenario.n_clusters,
+        n_items=scenario.n_items,
+        true_theta=scenario.theta,
+    )
+    elapsed = time.time() - start
+    return {
+        "scenario": asdict(scenario),
+        "settings": {
+            "n_iter": n_iter,
+            "burn_in": burn_in,
+            "thin": thin,
+            "n_restarts": n_restarts,
+            "use_py_prior": False,
+            "include_order_prior": False,
+            "use_annealing": use_annealing,
+            "annealing_schedule_type": annealing_schedule_type,
+            "annealing_plateau_frac": annealing_plateau_frac,
+            "temp_min": temp_min,
+            "temp_max": temp_max,
+            "block_density": scenario.block_density,
+            "true_n_clusters": scenario.n_clusters,
+            "fit_n_clusters": n_clusters_fit,
+            "init_strategy": "spectral",
         },
         "runtime_seconds": elapsed,
         "tau_true": tau_true,
@@ -585,7 +805,21 @@ def print_summary(results: list[dict[str, Any]]) -> None:
         return
     THRESHOLD = 0.8
     W = 46  # width of the scenario descriptor column
-    header = f"  {'Parameters':<{W}}  {'Acc':>6}  {'ARI':>6}  {'F1':>6}  {'nKem':>6}  {'|ΔK|':>5}  {'s':>5}"
+
+    n_pass = 0
+    metrics_list = []
+    single_cluster = all(r["scenario"]["n_clusters"] == 1 for r in results)
+
+    if single_cluster:
+        header = (
+            f"  {'Parameters':<{W}}  {'bARI':>6}  {'BlkF1':>6}  {'|ΔK|':>5}  {'ΔK':>5}"
+            f"  {'trueK':>5}  {'predK':>5}  {'nKem':>6}  {'s':>5}"
+        )
+    else:
+        header = (
+            f"  {'Parameters':<{W}}  {'Acc':>6}  {'ARI':>6}  {'bARI':>6}"
+            f"  {'BlkF1':>6}  {'nKem':>6}  {'|ΔK|':>5}  {'ΔK':>5}  {'s':>5}"
+        )
     sep = "  " + "─" * (len(header) - 2)
 
     print()
@@ -593,8 +827,6 @@ def print_summary(results: list[dict[str, Any]]) -> None:
     print(header)
     print(sep)
 
-    n_pass = 0
-    metrics_list = []
     for result in results:
         sc = result["scenario"]
         m  = result["metrics"]
@@ -608,36 +840,158 @@ def print_summary(results: list[dict[str, Any]]) -> None:
             f"C={sc['n_clusters']} N={sc['n_assessors']:>3} m={sc['n_items']:>2} "
             f"bd={bd:.2f} θ={sc['theta']}"
         )
-        print(
-            f"  {ok} {desc:<{W - 2}}"
-            f"  {acc:>6.3f}"
-            f"  {m['adjusted_rand_index']:>6.3f}"
-            f"  {m['weighted_same_block_f1']:>6.3f}"
-            f"  {m['weighted_normalized_kemeny_p_half']:>6.3f}"
-            f"  {m['weighted_block_count_error']:>5.2f}"
-            f"  {result['runtime_seconds']:>5.1f}"
-        )
+        # per-cluster block counts (for display)
+        pc = m["per_cluster"]
+        true_k_str = "/".join(str(c["true_n_blocks"]) for c in pc)
+        pred_k_str = "/".join(str(c["pred_n_blocks"]) for c in pc)
+        if single_cluster:
+            print(
+                f"  {ok} {desc:<{W - 2}}"
+                f"  {m['weighted_block_ari']:>6.3f}"
+                f"  {m['weighted_same_block_f1']:>6.3f}"
+                f"  {m['weighted_block_count_error']:>5.2f}"
+                f"  {m['weighted_block_count_signed_error']:>+5.2f}"
+                f"  {true_k_str:>5}"
+                f"  {pred_k_str:>5}"
+                f"  {m['weighted_normalized_kemeny_p_half']:>6.3f}"
+                f"  {result['runtime_seconds']:>5.1f}"
+            )
+        else:
+            print(
+                f"  {ok} {desc:<{W - 2}}"
+                f"  {acc:>6.3f}"
+                f"  {m['adjusted_rand_index']:>6.3f}"
+                f"  {m['weighted_block_ari']:>6.3f}"
+                f"  {m['weighted_same_block_f1']:>6.3f}"
+                f"  {m['weighted_normalized_kemeny_p_half']:>6.3f}"
+                f"  {m['weighted_block_count_error']:>5.2f}"
+                f"  {m['weighted_block_count_signed_error']:>+5.2f}"
+                f"  {result['runtime_seconds']:>5.1f}"
+            )
 
     print(sep)
     n = len(results)
-    print(
-        f"  {'─ Mean':<{W}}"
-        f"  {statistics.mean(m['aligned_cluster_accuracy'] for m in metrics_list):>6.3f}"
-        f"  {statistics.mean(m['adjusted_rand_index'] for m in metrics_list):>6.3f}"
-        f"  {statistics.mean(m['weighted_same_block_f1'] for m in metrics_list):>6.3f}"
-        f"  {statistics.mean(m['weighted_normalized_kemeny_p_half'] for m in metrics_list):>6.3f}"
-        f"  {statistics.mean(m['weighted_block_count_error'] for m in metrics_list):>5.2f}"
-        f"  {statistics.mean(r['runtime_seconds'] for r in results):>5.1f}"
-    )
+    if single_cluster:
+        print(
+            f"  {'─ Mean':<{W}}"
+            f"  {statistics.mean(m['weighted_block_ari'] for m in metrics_list):>6.3f}"
+            f"  {statistics.mean(m['weighted_same_block_f1'] for m in metrics_list):>6.3f}"
+            f"  {statistics.mean(m['weighted_block_count_error'] for m in metrics_list):>5.2f}"
+            f"  {statistics.mean(m['weighted_block_count_signed_error'] for m in metrics_list):>+5.2f}"
+            f"  {'':>5}  {'':>5}"
+            f"  {statistics.mean(m['weighted_normalized_kemeny_p_half'] for m in metrics_list):>6.3f}"
+            f"  {statistics.mean(r['runtime_seconds'] for r in results):>5.1f}"
+        )
+    else:
+        print(
+            f"  {'─ Mean':<{W}}"
+            f"  {statistics.mean(m['aligned_cluster_accuracy'] for m in metrics_list):>6.3f}"
+            f"  {statistics.mean(m['adjusted_rand_index'] for m in metrics_list):>6.3f}"
+            f"  {statistics.mean(m['weighted_block_ari'] for m in metrics_list):>6.3f}"
+            f"  {statistics.mean(m['weighted_same_block_f1'] for m in metrics_list):>6.3f}"
+            f"  {statistics.mean(m['weighted_normalized_kemeny_p_half'] for m in metrics_list):>6.3f}"
+            f"  {statistics.mean(m['weighted_block_count_error'] for m in metrics_list):>5.2f}"
+            f"  {statistics.mean(m['weighted_block_count_signed_error'] for m in metrics_list):>+5.2f}"
+            f"  {statistics.mean(r['runtime_seconds'] for r in results):>5.1f}"
+        )
     print(sep)
     status = "all passed ✓" if n_pass == n else f"{n - n_pass} scenario(s) below acc {THRESHOLD:.0%}"
     print(f"  Passed {n_pass}/{n}  —  {status}")
     print()
 
 
+def large_study_oat_scenarios() -> list[Scenario]:
+    """Large simulation study: OAT design for all cluster counts.
+
+    Each axis is swept while all other parameters are held at their central
+    defaults.  C=1 is included in the cluster sweep; it also gets its own
+    dedicated block_density sweep (since block structure is the primary
+    interest for C=1).
+
+    Parameter grids
+    ---------------
+    n_clusters   : 1, 2, 5, 10, 15, 20
+    n_assessors  : 20, 50, 100, 200, 500, 1000
+    n_items      : 5, 10, 20, 50, 100
+    block_density: 0.0, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0
+    theta        : 0.01, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0
+
+    OAT defaults
+    ------------
+    C_default  = 5
+    N_default  = 200
+    m_default  = 20
+    bd_default = 0.4
+    θ_default  = 1.0
+    """
+    N_VALUES       = (20, 50, 100, 200, 500, 1000)
+    M_VALUES       = (5, 10, 20, 50, 100)
+    BD_VALUES      = (0.0, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0)
+    THETA_VALUES   = (0.01, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0)
+    C_ALL_VALUES   = (1, 2, 5, 10, 15, 20)
+    SEEDS          = [42, 123, 999]
+
+    # OAT defaults
+    C_DEF  = 5
+    N_DEF  = 200
+    M_DEF  = 20
+    BD_DEF = 0.4
+    TH_DEF = 1.0
+
+    def _name(c, n, m, bd, th):
+        bd_str = f"{bd:.2f}".replace(".", "p")
+        th_str = str(th).replace(".", "p")
+        return f"c{c}_n{n}_m{m}_bd{bd_str}_theta{th_str}"
+
+    base_specs: list[tuple] = []
+    seen: set[tuple] = set()
+
+    def _add(c, n, m, bd, th):
+        key = (c, n, m, bd, th)
+        if key not in seen:
+            seen.add(key)
+            base_specs.append((_name(c, n, m, bd, th), c, n, m, bd, th))
+
+    # ── Vary C (all cluster counts, other axes at default) ───────────────────
+    for c in C_ALL_VALUES:
+        _add(c, N_DEF, M_DEF, BD_DEF, TH_DEF)
+
+    # ── Vary N ───────────────────────────────────────────────────────────────
+    for n in N_VALUES:
+        _add(C_DEF, n, M_DEF, BD_DEF, TH_DEF)
+
+    # ── Vary m ───────────────────────────────────────────────────────────────
+    for m in M_VALUES:
+        _add(C_DEF, N_DEF, m, BD_DEF, TH_DEF)
+
+    # ── Vary block_density ───────────────────────────────────────────────────
+    for bd in BD_VALUES:
+        _add(C_DEF, N_DEF, M_DEF, bd, TH_DEF)
+
+    # ── Vary theta ───────────────────────────────────────────────────────────
+    for th in THETA_VALUES:
+        _add(C_DEF, N_DEF, M_DEF, BD_DEF, th)
+
+    scenarios: list[Scenario] = []
+    for base_name, n_clusters, n_assessors, n_items, block_density, theta in base_specs:
+        for seed in SEEDS:
+            scenarios.append(
+                Scenario(
+                    name=f"{base_name}_seed{seed}",
+                    n_clusters=n_clusters,
+                    n_assessors=n_assessors,
+                    n_items=n_items,
+                    theta=theta,
+                    block_density=block_density,
+                    seed=seed,
+                )
+            )
+    return scenarios
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run tied Mallows recovery simulations.")
-    parser.add_argument("--mode", choices=("early", "grid", "contrast"), default="early")
+    parser.add_argument("--mode", choices=("early", "grid", "contrast", "single_cluster_bd", "large_oat", "large_oat_spectral"), default="early")
     parser.add_argument("--include-c10", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--n-iter", type=int, default=8000)
     parser.add_argument("--burn-in", type=int, default=5000)
@@ -656,6 +1010,12 @@ def main() -> None:
         scenarios = early_test_scenarios()
     elif args.mode == "grid":
         scenarios = larger_grid_scenarios(include_c10=args.include_c10)
+    elif args.mode == "single_cluster_bd":
+        scenarios = single_cluster_bd_scenarios()
+    elif args.mode == "large_oat":
+        scenarios = large_study_oat_scenarios()
+    elif args.mode == "large_oat_spectral":
+        scenarios = large_study_oat_scenarios()
     else:
         scenarios = contrast_grid_scenarios(include_c10=args.include_c10)
     if args.limit is not None:
@@ -721,7 +1081,8 @@ def main() -> None:
             f"  C={scenario.n_clusters}, N={scenario.n_assessors}, n={scenario.n_items}, "
             f"bd={scenario.block_density:.2f}, theta={scenario.theta}, seed={scenario.seed}"
         )
-        result = run_scenario(
+        runner = run_scenario_spectral_init if args.mode == "large_oat_spectral" else run_scenario
+        result = runner(
             scenario,
             n_iter=args.n_iter,
             burn_in=args.burn_in,

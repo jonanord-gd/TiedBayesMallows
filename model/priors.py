@@ -4,47 +4,43 @@ import math, time
 from functools import lru_cache
 from typing import List, Optional, Tuple
 
+import numpy as np
+try:
+    from scipy.special import gammaln as _vec_lgamma
+except ImportError:
+    _vec_lgamma = np.vectorize(math.lgamma)
 
-def build_log_qfactorials(n: int, q: float) -> List[float]:
-    """log([k]_q!) for k=0..n in O(n) for fixed q."""
+
+def build_log_qfactorials(n: int, q: float) -> np.ndarray:
+    """log([k]_q!) for k=0..n, returned as a numpy array of shape (n+1,)."""
     if n < 0:
         raise ValueError("n must be >= 0")
-    out = [0.0] * (n + 1)
-    if n == 0:
-        return out
-    if q <= 0.0:
+    out = np.zeros(n + 1)
+    if n == 0 or q <= 0.0:
         return out
     if abs(q - 1.0) < 1e-12:
-        for k in range(1, n + 1):
-            out[k] = math.lgamma(k + 1)
+        out[1:] = np.cumsum(np.log(np.arange(1, n + 1, dtype=np.float64)))
         return out
-
     log_denom = math.log(1.0 - q)
-    qpow = q
-    acc = 0.0
-    for i in range(1, n + 1):
-        acc += math.log(1.0 - qpow) - log_denom
-        out[i] = acc
-        qpow *= q
+    qpows = np.power(q, np.arange(1, n + 1, dtype=np.float64))
+    out[1:] = np.cumsum(np.log1p(-qpows) - log_denom)
     return out
 
 
 # internal cached computation when log_qfact is not provided
 def _log_Z_star_core(sizes_tuple: Tuple[int, ...], theta: float) -> float:
     # builds qfactorials internally; sizes_tuple is tuple of ints
-    sizes = list(sizes_tuple)
     if theta <= 0:
         return float("-inf")
-    n = sum(sizes)
+    n = sum(sizes_tuple)
     q = math.exp(-1.0 * theta)
-
-    logP = sum(math.lgamma(s + 1) for s in sizes)
-
+    sizes_arr = np.asarray(sizes_tuple, dtype=np.intp)
+    logP = float(_vec_lgamma(sizes_arr + 1).sum())
     log_qfact = build_log_qfactorials(n, q)
-    return logP + (log_qfact[n] - sum(log_qfact[s] for s in sizes))
+    return logP + (float(log_qfact[n]) - float(log_qfact[sizes_arr].sum()))
 
 
-def log_Z_star_from_sizes(sizes: List[int], theta: float, log_qfact: Optional[List[float]] = None) -> float:
+def log_Z_star_from_sizes(sizes: List[int], theta: float, log_qfact=None) -> float:
     # if caller didn't supply precomputed log_qfactorials, use core
     if log_qfact is None:
         return _log_Z_star_core(tuple(sizes), theta)
@@ -53,13 +49,12 @@ def log_Z_star_from_sizes(sizes: List[int], theta: float, log_qfact: Optional[Li
         return float("-inf")
     n = sum(sizes)
     q = math.exp(-1.0 * theta)
-
-    logP = sum(math.lgamma(s + 1) for s in sizes)
-
-    if len(log_qfact) < n + 1:
-        log_qfact = build_log_qfactorials(n, q)
-
-    return logP + (log_qfact[n] - sum(log_qfact[s] for s in sizes))
+    sizes_arr = np.asarray(sizes, dtype=np.intp)
+    logP = float(_vec_lgamma(sizes_arr + 1).sum())
+    log_qfact_arr = np.asarray(log_qfact)
+    if len(log_qfact_arr) < n + 1:
+        log_qfact_arr = build_log_qfactorials(n, q)
+    return logP + (float(log_qfact_arr[n]) - float(log_qfact_arr[sizes_arr].sum()))
 
 
 def log_Z_star(blocks: List[List[int]], theta: float) -> float:
