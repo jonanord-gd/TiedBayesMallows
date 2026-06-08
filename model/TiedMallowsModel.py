@@ -16,7 +16,7 @@ For the full documentation, import from model or see model.core.
 from .core import MixtureRankingModel
 from .dataclasses import ClusterParams, MCMCSamples, MixtureState, SamplerConfig
 from .summaries import estimate_z_from_frequency, summarize_theta
-from .initialization import init_spectral_with_z, init_clusters_default
+from .initialization import init_spectral_with_z, init_clusters_default, init_blocks_spectral
 from .moves import fast_gibbs_reassign_one_item, icm_sweep_cluster
 from .utils import logsumexp, sample_categorical_from_logweights, dirichlet_sample
 from .profiling import enable_profiling, disable_profiling, get_profiler, reset_profiling, MCMCProfiler
@@ -32,6 +32,7 @@ __all__ = [
     "summarize_theta",
     "init_spectral_with_z",
     "init_clusters_default",
+    "init_blocks_spectral",
     "fast_gibbs_reassign_one_item",
     "icm_sweep_cluster",
     "logsumexp",

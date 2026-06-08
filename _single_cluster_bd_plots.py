@@ -82,14 +82,25 @@ def block_ari_from_per_cluster(pc: dict[str, Any], n_items: int) -> float:
 
 # ── Data loading ─────────────────────────────────────────────────────────────
 
-def latest_run_dir(base_dir: Path) -> Path:
-    candidates = sorted(
-        p for p in base_dir.iterdir()
-        if p.is_dir() and "single_cluster_bd" in p.name
-    )
-    if not candidates:
-        raise FileNotFoundError(f"No single_cluster_bd run found in {base_dir}")
-    return candidates[-1]
+def latest_run_dir(base_dir: Path | None = None) -> Path:
+    """Return the most recent single_cluster_bd run directory.
+
+    Searches ``simulation_recovery_runs_single`` by default (the dedicated
+    output folder), falling back to ``simulation_recovery_runs`` for older runs.
+    Pass *base_dir* explicitly to override.
+    """
+    if base_dir is None:
+        search_dirs = [Path("simulation_recovery_runs_single"), Path("simulation_recovery_runs")]
+    else:
+        search_dirs = [base_dir]
+
+    for d in search_dirs:
+        if not d.exists():
+            continue
+        candidates = sorted(p for p in d.iterdir() if p.is_dir() and "single_cluster_bd" in p.name)
+        if candidates:
+            return candidates[-1]
+    raise FileNotFoundError("No single_cluster_bd run found in simulation_recovery_runs_single or simulation_recovery_runs")
 
 
 def load_results(run_dir: Path) -> list[dict[str, Any]]:
@@ -136,25 +147,33 @@ def extract_row(result: dict[str, Any]) -> dict[str, Any]:
 
 # ── Plotting ──────────────────────────────────────────────────────────────────
 
-N_ASSESSORS_VALUES = (100, 300, 700)
-THETA_VALUES       = (0.1, 0.5, 1.0, 3.0)
-BLOCK_DENSITIES    = (0.00, 0.10, 0.20, 0.40, 0.60, 0.80, 1.00)
+N_ASSESSORS_VALUES = (10, 100, 300)
+THETA_VALUES       = (0.1, 0.5, 1.0)
+BLOCK_DENSITIES    = (0.10, 0.25, 0.50, 0.75, 1.00)
 
 # Color encodes n_assessors; line style encodes theta
-_N_COLORS  = {100: "#e41a1c", 300: "#377eb8", 700: "#4daf4a"}
+_N_COLORS  = {10: "#e41a1c", 100: "#377eb8", 300: "#4daf4a"}
 _T_STYLES  = {0.1: (0, (1, 1)), 0.5: "--", 1.0: "-.", 3.0: "-"}
 _T_LABELS  = {0.1: "θ=0.1", 0.5: "θ=0.5", 1.0: "θ=1.0", 3.0: "θ=3.0"}
-_N_LABELS  = {100: "N=100", 300: "N=300", 700: "N=700"}
+_N_LABELS  = {10: "N=10", 100: "N=100", 300: "N=300"}
 
 
 def _build_grid(
     rows: list[dict[str, Any]],
 ) -> dict[tuple[int, int, float, float], dict[str, Any]]:
-    """Index rows by (n_items, n_assessors, theta, block_density)."""
-    grid: dict[tuple[int, int, float, float], dict[str, Any]] = {}
+    """Index rows by (n_items, n_assessors, theta, block_density), averaging over seeds."""
+    numeric_keys = ("true_n_blocks", "pred_n_blocks", "signed_error", "block_ari", "block_f1", "norm_kemeny")
+    buckets: dict[tuple[int, int, float, float], list[dict[str, Any]]] = defaultdict(list)
     for r in rows:
         key = (r["n_items"], r["n_assessors"], r["theta"], r["block_density"])
-        grid[key] = r
+        buckets[key].append(r)
+    grid: dict[tuple[int, int, float, float], dict[str, Any]] = {}
+    for key, bucket in buckets.items():
+        averaged = dict(bucket[0])  # copy non-numeric fields from first row
+        for k in numeric_keys:
+            vals = [b[k] for b in bucket if not math.isnan(b[k])]
+            averaged[k] = sum(vals) / len(vals) if vals else float("nan")
+        grid[key] = averaged
     return grid
 
 
@@ -163,7 +182,7 @@ METRICS = [
     ("norm_kemeny",  "Normalized Kemeny distance"),
 ]
 
-N_ITEMS_VALUES = (10, 20, 50, 100)
+N_ITEMS_VALUES = (10, 50, 100)
 
 
 def plot_single_cluster_bd(

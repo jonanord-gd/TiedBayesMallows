@@ -37,6 +37,10 @@ class MCMCSamples:
     theta_accept_counts: Optional[List[List[int]]] = None
     block_proposals: Optional[List[List[int]]] = None
     block_accept_counts: Optional[List[List[int]]] = None
+    # Per-observation marginal log-likelihoods for arviz WAIC/LOO.
+    # Shape: [T][N] — one list of N floats per saved draw.
+    # log p(r_i | tau, blocks, theta) = logsumexp_c[log(tau_c) - theta_c*D_ic - logZ_c]
+    log_likelihood: Optional[List[List[float]]] = None
 
 
 @dataclass

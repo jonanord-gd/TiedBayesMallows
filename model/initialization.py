@@ -66,22 +66,24 @@ def _build_item_agreement_matrix(rankings: List[List[int]]) -> np.ndarray:
     """
     n_items = len(rankings[0])
     n_rankings = len(rankings)
-    
-    # Count pairwise preferences
-    preference_count = np.zeros((n_items, n_items), dtype=np.float64)
-    
-    for ranking in rankings:
-        pos = {item: idx for idx, item in enumerate(ranking)}
-        for i in range(n_items):
-            for j in range(n_items):
-                if i != j:
-                    # If i appears before j in this ranking, increment preference for i over j
-                    if pos[i] < pos[j]:
-                        preference_count[i, j] += 1.0
-    
-    # Normalize by number of rankings
-    agreement = preference_count / n_rankings
-    return agreement
+
+    # Build position matrix: pos_matrix[r, item] = position of item in ranking r
+    # rankings[r][pos] = item  →  inverse permutation = argsort
+    rankings_array = np.array(rankings, dtype=np.int32)          # (N, n_items)
+    pos_matrix = np.argsort(rankings_array, axis=1).astype(np.int16)  # (N, n_items)
+
+    # Vectorized: preference_count[i, j] = #{r : pos_matrix[r, i] < pos_matrix[r, j]}
+    # Process rankings in batches to keep memory under ~100 MB.
+    # Batch of B: (B, n_items, n_items) bool  →  B * n_items^2 bytes.
+    # For n_items=1200, B=50  →  72 MB.
+    preference_count = np.zeros((n_items, n_items), dtype=np.float32)
+    batch_size = 50
+    for start in range(0, n_rankings, batch_size):
+        batch = pos_matrix[start: start + batch_size]            # (B, n_items)
+        # [r, i, j] = True  iff item i comes before item j in ranking r
+        preference_count += (batch[:, :, None] < batch[:, None, :]).sum(axis=0)
+
+    return preference_count.astype(np.float64) / n_rankings
 
 
 def _build_antisymmetric_preference_matrix(agreement: np.ndarray, 
@@ -319,9 +321,15 @@ def init_blocks_spectral(
     if seed is not None:
         np.random.seed(seed)
     
-    n_items = len(rankings[0])
     n_rankings = len(rankings)
-    
+
+    # Re-index items to 0-based consecutive integers to handle non-0-indexed IDs
+    all_items = sorted(set(item for r in rankings for item in r))
+    item_to_idx = {item: idx for idx, item in enumerate(all_items)}
+    idx_to_item = {idx: item for idx, item in enumerate(all_items)}
+    rankings = [[item_to_idx[item] for item in r] for r in rankings]
+    n_items = len(all_items)
+
     # Step 1: Build item-level agreement matrix (how often each item is preferred to each other)
     agreement = _build_item_agreement_matrix(rankings)
     
@@ -365,21 +373,28 @@ def init_blocks_spectral(
             cluster_data = [rankings[i] for i in cluster_indices]
             
             # Compute Borda consensus ranking for this cluster
-            pos_sum = np.zeros(n_items)
+            # Use per-item counts so partial rankings (different items per assessor) work
+            pos_sum  = np.zeros(n_items)
+            item_cnt = np.zeros(n_items, dtype=np.int64)
             for ranking in cluster_data:
-                pos = {item: idx for idx, item in enumerate(ranking)}
-                for item in range(n_items):
-                    pos_sum[item] += pos[item]
-            
-            mean_pos = pos_sum / len(cluster_data)
-            borda_ranking = sorted(range(n_items), key=lambda i: mean_pos[i])
-            
-            # Form blocks using selected method
-            preference = _build_antisymmetric_preference_matrix(agreement, borda_ranking)
-            K = _sample_pitman_yor_blocks(gamma, delta, n_items, rng)
+                for rank_pos, item in enumerate(ranking):
+                    pos_sum[item]  += rank_pos
+                    item_cnt[item] += 1
+
+            cluster_items = [item for item in range(n_items) if item_cnt[item] > 0]
+            mean_pos = {item: pos_sum[item] / item_cnt[item] for item in cluster_items}
+            borda_ranking = sorted(cluster_items, key=lambda i: mean_pos[i])
+
+            if py_sampling:
+                K = _sample_pitman_yor_blocks(gamma, delta, len(borda_ranking), rng)
+            else:
+                K = max(1, round(len(borda_ranking) / 2))
             blocks = _agglomerative_block_formation_antisymmetric(
                 borda_ranking, agreement, K
             )
+
+        # Map local indices back to original item IDs
+        blocks = [[idx_to_item[i] for i in block] for block in blocks]
 
         # Create ClusterParams object
         cluster = ClusterParams(
@@ -456,16 +471,30 @@ def init_spectral_with_z(
     
     # Step 2: Spectral clustering on rankings
     if affinity == 'agreement':
-        ranking_agreement = np.zeros((n_rankings, n_rankings))
-        for i in range(n_rankings):
-            for j in range(i + 1, n_rankings):
-                inv = _kendall_inversions(rankings[i], rankings[j])
-                total_pairs = n_items * (n_items - 1) // 2
-                agree = total_pairs - inv
-                ranking_agreement[i, j] = agree
-                ranking_agreement[j, i] = agree
-        
-        np.fill_diagonal(ranking_agreement, n_items * (n_items - 1) // 2)
+        # Build position matrix: pos_matrix[r, item] = position of item in ranking r
+        rankings_arr = np.array(rankings, dtype=np.int32)          # (N, n_items)
+        pos_matrix   = np.argsort(rankings_arr, axis=1)            # (N, n_items)
+
+        total_pairs = n_items * (n_items - 1) // 2
+        pairs_a, pairs_b = np.triu_indices(n_items, k=1)           # each (n_pairs,)
+        n_pairs = len(pairs_a)
+
+        ranking_agreement = np.zeros((n_rankings, n_rankings), dtype=np.float32)
+
+        # Process item-pairs in batches.
+        # For batch B and N rankings: X is (N, B) float32  →  B*N*4 bytes.
+        # N=2600, B=5000  →  ~52 MB; two matmuls (N,B)×(B,N) per batch.
+        batch_size = 5000
+        for start in range(0, n_pairs, batch_size):
+            end   = min(start + batch_size, n_pairs)
+            a_idx = pairs_a[start:end]
+            b_idx = pairs_b[start:end]
+            # X[r, k] = 1 if item a_idx[k] precedes item b_idx[k] in ranking r
+            X     = (pos_matrix[:, a_idx] < pos_matrix[:, b_idx]).astype(np.float32)
+            X_neg = 1.0 - X
+            ranking_agreement += X @ X.T + X_neg @ X_neg.T
+
+        np.fill_diagonal(ranking_agreement, total_pairs)
         ranking_agreement_norm = ranking_agreement / (ranking_agreement.max() + 1e-10)
         
         sc = SpectralClustering(
@@ -501,20 +530,21 @@ def init_spectral_with_z(
         else:
             cluster_data = [rankings[i] for i in cluster_indices]
             
-            pos_sum = np.zeros(n_items)
+            pos_sum  = np.zeros(n_items)
+            item_cnt = np.zeros(n_items, dtype=np.int64)
             for ranking in cluster_data:
-                pos = {item: idx for idx, item in enumerate(ranking)}
-                for item in range(n_items):
-                    pos_sum[item] += pos[item]
-            
-            mean_pos = pos_sum / len(cluster_data)
-            borda_ranking = sorted(range(n_items), key=lambda i: mean_pos[i])
-            
-            preference = _build_antisymmetric_preference_matrix(agreement, borda_ranking)
+                for rank_pos, item in enumerate(ranking):
+                    pos_sum[item]  += rank_pos
+                    item_cnt[item] += 1
+
+            cluster_items = [item for item in range(n_items) if item_cnt[item] > 0]
+            mean_pos = {item: pos_sum[item] / item_cnt[item] for item in cluster_items}
+            borda_ranking = sorted(cluster_items, key=lambda i: mean_pos[i])
+
             if py_sampling:
-                K = _sample_pitman_yor_blocks(gamma, delta, n_items, rng)
+                K = _sample_pitman_yor_blocks(gamma, delta, len(borda_ranking), rng)
             else:
-                K = max(1, round(n_items / 2))
+                K = max(1, round(len(borda_ranking) / 2))
             blocks = _agglomerative_block_formation_antisymmetric(
                 borda_ranking, agreement, K
             )

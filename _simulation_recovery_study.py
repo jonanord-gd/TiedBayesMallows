@@ -26,11 +26,19 @@ import itertools
 import json
 import math
 import statistics
+import sys
 import time
 import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+
+# Ensure the project root (parent of this file) is on sys.path so that
+# `helper_functions` and `model` can be found regardless of whether the script
+# is run from the project root or from a sub-directory (e.g. scripts/).
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent if Path(__file__).resolve().parent.name == "scripts" else Path(__file__).resolve().parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 import numpy as np
 
@@ -116,7 +124,7 @@ def larger_grid_scenarios(include_c10: bool = False) -> list[Scenario]:
     return build_scenarios(base_specs, seeds=[101])
 
 
-def single_cluster_bd_scenarios() -> list[Scenario]:
+def single_cluster_bd_scenarios(n_seeds: int = 1) -> list[Scenario]:
     """Single-cluster sweep over block_density.
 
     Purpose: assess consensus recovery for C=1 as block density varies from
@@ -130,6 +138,11 @@ def single_cluster_bd_scenarios() -> list[Scenario]:
       - n_assessors   : 100, 300, 700
       - n_items       : 10, 20, 50, 100
       - theta         : 0.1, 0.5, 1.0, 3.0
+
+    Args:
+        n_seeds: Number of random seeds to run per scenario. Seeds are drawn
+                 from a fixed sequence starting at 101 so runs are reproducible
+                 and can be extended later without repeating earlier seeds.
     """
     BLOCK_DENSITIES = (0.00, 0.10, 0.20, 0.40, 0.60, 0.80, 1.00)
     base_specs: list[tuple[str, int, int, int, float, float]] = []
@@ -143,7 +156,8 @@ def single_cluster_bd_scenarios() -> list[Scenario]:
                         f"c1_n{n_assessors}_m{n_items}_bd{bd_str}_theta{theta_str}",
                         1, n_assessors, n_items, block_density, theta,
                     ))
-    return build_scenarios(base_specs, seeds=[101])
+    seeds = list(range(101, 101 + n_seeds))
+    return build_scenarios(base_specs, seeds=seeds)
 
 
 def contrast_grid_scenarios(include_c10: bool = False) -> list[Scenario]:
@@ -992,6 +1006,7 @@ def large_study_oat_scenarios() -> list[Scenario]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run tied Mallows recovery simulations.")
     parser.add_argument("--mode", choices=("early", "grid", "contrast", "single_cluster_bd", "large_oat", "large_oat_spectral"), default="early")
+    parser.add_argument("--n-seeds", type=int, default=1, help="Number of seeds per scenario (single_cluster_bd mode only). Seeds start at 101.")
     parser.add_argument("--include-c10", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--n-iter", type=int, default=8000)
     parser.add_argument("--burn-in", type=int, default=5000)
@@ -1004,14 +1019,21 @@ def main() -> None:
     parser.add_argument("--temp-max", type=float, default=1.0)
     parser.add_argument("--limit", type=int, default=None, help="Optional cap on number of scenarios to run.")
     parser.add_argument("--resume-dir", type=str, default=None, help="Resume an interrupted run from this directory.")
+    parser.add_argument("--runs-dir", type=str, default=None, help="Base directory for run output (default: simulation_recovery_runs_single for single_cluster_bd, simulation_recovery_runs otherwise).")
     args = parser.parse_args()
+
+    _default_runs_dir = (
+        "simulation_recovery_runs_single" if args.mode == "single_cluster_bd"
+        else "simulation_recovery_runs"
+    )
+    runs_dir = Path(args.runs_dir) if args.runs_dir else Path(_default_runs_dir)
 
     if args.mode == "early":
         scenarios = early_test_scenarios()
     elif args.mode == "grid":
         scenarios = larger_grid_scenarios(include_c10=args.include_c10)
     elif args.mode == "single_cluster_bd":
-        scenarios = single_cluster_bd_scenarios()
+        scenarios = single_cluster_bd_scenarios(n_seeds=args.n_seeds)
     elif args.mode == "large_oat":
         scenarios = large_study_oat_scenarios()
     elif args.mode == "large_oat_spectral":
@@ -1039,7 +1061,7 @@ def main() -> None:
         ]
     else:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        out_dir = Path("simulation_recovery_runs") / f"recovery_{args.mode}_{timestamp}"
+        out_dir = runs_dir / f"recovery_{args.mode}_{timestamp}"
         out_dir.mkdir(parents=True, exist_ok=True)
         base_scenario_names = sorted({s.name.rsplit("_seed", 1)[0] for s in scenarios})
         run_metadata = {

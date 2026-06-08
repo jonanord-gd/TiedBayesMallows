@@ -56,13 +56,10 @@ def finite_n_threshold(analytical_threshold: float, n_assessors: int) -> float:
 
 def plot_block_merge_thresholds():
     thetas = np.linspace(0.05, 10.0, 500)
-    finite_n_thetas = np.linspace(0.05, 10.0, 4000)
     merge_pairs = [(1, 1), (2, 1), (2, 2), (3, 2), (3, 3), (4, 2), (4, 3)]
-    n_assessors_example = 2000
     max_size = max(s1 + s2 for s1, s2 in merge_pairs)
 
     analytical_curves: dict[tuple[int, int], list[float]] = {}
-    empirical_curves: dict[tuple[int, int], list[float]] = {}
     for s1, s2 in merge_pairs:
         analytical_vals = []
         for theta in thetas:
@@ -72,44 +69,18 @@ def plot_block_merge_thresholds():
             analytical_vals.append(threshold)
         analytical_curves[(s1, s2)] = analytical_vals
 
-        empirical_vals = []
-        for theta in finite_n_thetas:
-            q = math.exp(-theta)
-            log_qfact = build_log_qfactorials(max_size, q)
-            threshold = block_merge_threshold(s1, s2, theta, log_qfact)
-            empirical_vals.append(finite_n_threshold(threshold, n_assessors_example))
-        empirical_curves[(s1, s2)] = empirical_vals
-
     fig, ax = plt.subplots(1, 1, figsize=(10.5, 6.2))
     colors = plt.cm.viridis(np.linspace(0.1, 0.9, len(merge_pairs)))
     for color, (s1, s2) in zip(colors, merge_pairs):
         ax.plot(thetas, analytical_curves[(s1, s2)], color=color, linewidth=2.3, label=f"({s1},{s2})")
-        dashed_line = ax.step(
-            finite_n_thetas,
-            empirical_curves[(s1, s2)],
-            where="post",
-            color="#2b2b2b",
-            linestyle="--",
-            linewidth=1.15,
-            alpha=0.8,
-        )
-        dashed_line[0].set_path_effects([
-            pe.Stroke(linewidth=2.8, foreground="white", alpha=0.95),
-            pe.Normal(),
-        ])
     ax.axhline(0.5, color="grey", linestyle=":", alpha=0.6)
     ax.set_xlim(0, 10)
     ax.set_ylim(0, 0.55)
     ax.set_xlabel(r"$\theta$", fontsize=13)
-    ax.set_ylabel(r"Threshold $\bar{h}$", fontsize=13)
-    ax.set_title(r"Block-merge threshold $\bar{h}(\theta)$", fontsize=15)
+    ax.set_ylabel(r"Threshold $\bar{h}(\theta)$", fontsize=13)
+    ax.set_title(r"Block-merge threshold for different block sizes", fontsize=15)
     ax.legend(title="Merge sizes (s1,s2)", fontsize=9)
 
-    fig.suptitle(
-        rf"Solid: analytical threshold, dashed black: finite-$N$ threshold with $N={n_assessors_example}$",
-        fontsize=13,
-        y=0.98,
-    )
     fig.tight_layout()
     fig.savefig("block_merge_thresholds.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -125,8 +96,7 @@ def plot_block_merge_thresholds():
             parts.append(f"({s1},{s2}): {block_merge_threshold(s1, s2, theta, log_qfact):.3f}")
         print(f"  theta={theta:.1f} -> " + ", ".join(parts))
 
-    print()
-    print(f"Finite-N overlay uses N={n_assessors_example} assessors.")
+
 
 if __name__ == "__main__":
     plot_block_merge_thresholds()

@@ -329,13 +329,18 @@ class MixtureRankingModel:
         # Per-cluster adaptive step sizes for theta proposals
         self._theta_steps: List[float] = [self.cfg.theta_step] * self.C
 
-        # ── Collapsed-cluster tracking ────────────────────────────────────────────
-        # A cluster is marked permanently dead after COLLAPSE_PATIENCE consecutive
-        # iterations with 0 assessors.  Dead clusters are excluded from all future
-        # z-assignments and parameter updates, saving wasted computation.
-        self.COLLAPSE_PATIENCE: int = 20   # tuneable; set to 0 to disable
+        # ── Frozen-cluster tracking ───────────────────────────────────────────────
+        # A cluster is frozen immediately when it has 0 assessors: its blocks and
+        # theta are not updated that iteration.  Frozen clusters remain eligible
+        # for z-sampling (their weight comes from the Dirichlet prior on tau),
+        # so they can naturally resurrect when the sampler reassigns an assessor.
+        # _zero_streak records how many consecutive iterations a cluster has been
+        # empty; _dead_clusters is the set of currently-frozen clusters.
+        # COLLAPSE_PATIENCE is retained as an attribute for external inspection
+        # but no longer controls permanent death.
+        self.COLLAPSE_PATIENCE: int = 20   # kept for back-compat (no longer kills clusters)
         self._zero_streak: List[int] = [0] * self.C   # consecutive-empty counter
-        self._dead_clusters: set = set()               # permanently collapsed
+        self._dead_clusters: set = set()               # currently frozen (empty) clusters
 
         # Parallelization threshold: disable by default to avoid overhead
         # For large problems (N > 300), set this to enable parallelization
@@ -569,11 +574,10 @@ class MixtureRankingModel:
                       - thetas[np.newaxis, :] * D
                       - logZ[np.newaxis, :])
 
-        # Zero out dead clusters: force log-weight to -inf so they can never
-        # receive an assignment, making the collapse permanent.
-        if self._dead_clusters:
-            dead_arr = list(self._dead_clusters)
-            logweights[:, dead_arr] = -np.inf
+        # Frozen clusters (currently empty) are still eligible for z-assignment —
+        # their log-weight is driven purely by the Dirichlet prior on tau, which
+        # is small but positive, allowing natural resurrection when the sampler
+        # finds it beneficial to reassign an assessor to them.
 
         # Save old z for incremental H update
         old_z = state.z.copy()
@@ -681,24 +685,29 @@ class MixtureRankingModel:
         post = [init_mu[c] + int(counts[c]) for c in range(C)]
         state.tau = normalize_simplex(dirichlet_sample(post, rng))
 
-        # ── Collapse detection ────────────────────────────────────────────────
-        # Update zero-streak counters; permanently retire clusters that have
-        # been empty for COLLAPSE_PATIENCE consecutive iterations.
-        if self.COLLAPSE_PATIENCE > 0:
-            newly_dead: List[int] = []
-            for c in range(C):
+        # ── Freeze / resurrection tracking ────────────────────────────────────
+        # Clusters are frozen immediately when they have 0 assessors: their
+        # blocks and theta are not updated (handled by the empty-Rc guard in
+        # step()).  A frozen cluster is NOT permanently excluded from z-sampling,
+        # so it can be resurrected the moment at least one assessor enters it.
+        newly_frozen: List[int] = []
+        resurrected: List[int] = []
+        for c in range(C):
+            if counts[c] == 0:
+                self._zero_streak[c] += 1
+                if c not in self._dead_clusters:
+                    self._dead_clusters.add(c)
+                    newly_frozen.append(c)
+            else:
+                self._zero_streak[c] = 0
                 if c in self._dead_clusters:
-                    continue
-                if counts[c] == 0:
-                    self._zero_streak[c] += 1
-                    if self._zero_streak[c] >= self.COLLAPSE_PATIENCE:
-                        self._dead_clusters.add(c)
-                        newly_dead.append(c)
-                else:
-                    self._zero_streak[c] = 0
-            if newly_dead and self.verbose:
-                print(f"[Model] Clusters permanently retired (collapsed): {newly_dead}  "
-                      f"(total dead: {len(self._dead_clusters)}/{C})")
+                    self._dead_clusters.discard(c)
+                    resurrected.append(c)
+        if newly_frozen and self.verbose:
+            print(f"[Model] Clusters frozen (no assessors): {newly_frozen}  "
+                  f"(total frozen: {len(self._dead_clusters)}/{C})")
+        if resurrected and self.verbose:
+            print(f"[Model] Clusters resurrected: {resurrected}")
 
     def _cluster_rankings(self, c: int) -> List[List[int]]:
         # Cache self references
@@ -978,14 +987,12 @@ class MixtureRankingModel:
         block_accept_counts: List[int] = [0] * C
 
         for c in range(C):
-            # Skip permanently collapsed clusters — no assessors will ever be
-            # assigned to them again, so block/theta updates are meaningless.
-            if c in self._dead_clusters:
+            # Compute cluster rankings first; freeze immediately if the cluster
+            # has no assessors this iteration (blocks and theta are unchanged).
+            Rc = [r for r, zi in zip(rankings, state_z) if zi == c]
+            if not Rc:
                 continue
 
-            # Use cached state_z and rankings instead of accessing self repeatedly
-            Rc = [r for r, zi in zip(rankings, state_z) if zi == c]
-            
             # Update cluster blocks
             t_start = time.time()
             bp, ba, block_changed = self._update_cluster_blocks(
@@ -1047,6 +1054,7 @@ class MixtureRankingModel:
         save_tau: bool = False,
         save_theta: bool = False,
         save_logp: bool = True,
+        save_log_likelihood: bool = False,
         save_acceptance_details: bool = False,
         n_item_moves_per_cluster: int = 2,
         use_py_prior: bool = True,
@@ -1195,6 +1203,7 @@ class MixtureRankingModel:
                 theta_accept_counts = [] if save_acceptance_details else None,
                 block_proposals = [] if save_acceptance_details else None,
                 block_accept_counts = [] if save_acceptance_details else None,
+                log_likelihood = [] if save_log_likelihood else None,
             )
 
         def snapshot() -> None:
@@ -1208,6 +1217,8 @@ class MixtureRankingModel:
             samples.K.append([len(cl.blocks) for cl in self.state.clusters])
             if save_logp and samples.logp is not None:
                 samples.logp.append(self.log_joint())
+            if save_log_likelihood and samples.log_likelihood is not None:
+                samples.log_likelihood.append(self._compute_per_obs_log_lik())
 
         if self.verbose:
             print(f"\n[MCMC] Starting run: n_iter={n_iter}, burn_in={burn_in}, thin={thin}, theta_jump={theta_jump}")
@@ -1632,6 +1643,60 @@ class MixtureRankingModel:
 
         print_acceptance_summary(self.samples, self.C)
     
+    def _compute_per_obs_log_lik(self) -> List[float]:
+        """Per-observation marginal log-likelihoods at the current MCMC state.
+
+        Computes, for each ranker i:
+
+            log p(r_i | tau, blocks, theta)
+                = logsumexp_c [ log(tau_c) - theta_c * D[i,c] - log Z_c* ]
+
+        where D[i,c] is the cross-block disagreement distance from ranker i to
+        cluster c's consensus blocks.  The sum over clusters marginalises out the
+        latent cluster assignment z_i, which is the quantity needed for arviz
+        WAIC / LOO-CV.
+
+        The computation reuses the cached D matrix (N × C), so the marginal cost
+        on top of a normal MCMC iteration is O(N · C) — effectively free.
+
+        Returns
+        -------
+        list of float, length N
+        """
+        state = self.state
+        C = self.C
+
+        # ── per-cluster log Z* ────────────────────────────────────────────
+        qfact_cache = getattr(self, '_qfact_cache', {})
+        logZ = np.empty(C)
+        for c, cl in enumerate(state.clusters):
+            q_c = math.exp(-cl.theta)
+            qkey = round(q_c, 15)
+            if qkey not in qfact_cache:
+                qfact_cache[qkey] = build_log_qfactorials(self.n, q_c)
+            logZ[c] = log_Z_star_from_sizes(
+                self._cache[c].sizes, cl.theta, qfact_cache[qkey])
+
+        # ── distance matrix ───────────────────────────────────────────────
+        if self._D_cache is not None:
+            D = self._D_cache                      # (N, C) — already up-to-date
+        else:
+            D = self._compute_all_disagreements()  # fallback, rare
+
+        # ── vectorised logsumexp over clusters ───────────────────────────
+        log_tau = np.log(np.asarray(state.tau, dtype=np.float64))  # (C,)
+        thetas  = np.array([cl.theta for cl in state.clusters],
+                           dtype=np.float64)                         # (C,)
+
+        # logweights[i, c] = log(tau_c) - theta_c * D[i,c] - logZ_c
+        logw = log_tau[None, :] - thetas[None, :] * D - logZ[None, :]  # (N, C)
+
+        # numerically stable logsumexp along cluster axis
+        m = logw.max(axis=1, keepdims=True)
+        log_lik = (np.log(np.exp(logw - m).sum(axis=1)) + m[:, 0])   # (N,)
+
+        return log_lik.tolist()
+
     def log_joint(self) -> float:
         """Unnormalized log posterior (up to constants) of current state.
 
@@ -1702,6 +1767,81 @@ class MixtureRankingModel:
     def _require_samples(self) -> None:
         if self.samples is None:
             raise RuntimeError("Run run_mcmc(..., save_samples=True) first.")
+
+    def to_arviz(self, samples: Optional[MCMCSamples] = None) -> Any:
+        """Convert MCMC samples to an :class:`arviz.InferenceData` object.
+
+        The returned object contains a ``log_likelihood`` group (variable name
+        ``"y"``, shape ``(chain=1, draw=T, obs=N)``), which enables arviz's WAIC
+        and LOO-CV model-comparison utilities.
+
+        Parameters
+        ----------
+        samples : MCMCSamples, optional
+            Samples returned by :meth:`run_mcmc`.  Defaults to
+            ``self.samples`` (the most recent run).
+
+        Returns
+        -------
+        arviz.InferenceData
+
+        Examples
+        --------
+        Run MCMC, compute log-likelihoods, convert, and compare models::
+
+            state, samples = model.run_mcmc(5000, burn_in=1000, thin=5,
+                                            save_log_likelihood=True)
+            idata = model.to_arviz(samples)
+
+            # LOO-CV model comparison (arviz 1.x)
+            import arviz as az
+            print(az.loo(idata))
+
+            # Compare two models
+            idata2 = model2.to_arviz(samples2)
+            print(az.compare({"model1": idata, "model2": idata2}))
+
+        Notes
+        -----
+        Per-observation log-likelihoods are *marginalised* over the latent
+        cluster assignments:
+
+            log p(r_i | tau, blocks, theta)
+                = logsumexp_c [ log(tau_c) - theta_c * D[i,c] - log Z_c* ]
+
+        This avoids the label-switching problem that arises when conditioning
+        on the discrete z_i samples.
+        """
+        try:
+            import arviz as az
+        except ImportError as exc:
+            raise ImportError(
+                "arviz is required for to_arviz(). "
+                "Install it with: pip install arviz"
+            ) from exc
+
+        if samples is None:
+            samples = self.samples
+        if samples is None:
+            raise RuntimeError(
+                "No samples available. Run run_mcmc(..., save_log_likelihood=True) first."
+            )
+        if samples.log_likelihood is None:
+            raise RuntimeError(
+                "log_likelihood was not saved. "
+                "Re-run run_mcmc() with save_log_likelihood=True."
+            )
+
+        # Shape: (chain, draw, obs) = (1, T, N)
+        ll_array = np.array(samples.log_likelihood, dtype=np.float64)[np.newaxis, :, :]
+
+        # arviz 1.x: from_dict takes a single positional dict {group: {var: array}}
+        # arviz <0.16: from_dict took keyword arguments per group
+        try:
+            return az.from_dict({"log_likelihood": {"y": ll_array}})
+        except TypeError:
+            # Fallback for older arviz where log_likelihood was a keyword arg
+            return az.from_dict(log_likelihood={"y": ll_array})  # type: ignore[call-arg]
 
     def plot_trace_theta(self, *, burn: int = 0, combined: bool = True) -> None:
         """Plot theta trace for all clusters.

@@ -17,6 +17,9 @@ __pycache__/
 *.udata
 *.npy
 *.zip
+*.npz
+*.Rdata
+*.rds
 
 # Model run outputs
 **/runs/

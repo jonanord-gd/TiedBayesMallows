@@ -27,6 +27,7 @@ Usage
 -----
   python _timmm_consensus_study.py
   python _timmm_consensus_study.py --limit 5 --n-iter 2000 --burn-in 1000 --thin 10 --n-restarts 10
+  python _timmm_consensus_study.py --output-dir /data/runs/my_experiment
   python _timmm_consensus_study.py --resume-dir <dir>
 """
 
@@ -35,12 +36,28 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 import time
 import warnings
 from dataclasses import asdict, dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+
+# ── Ensure the project root is on sys.path ────────────────────────────────────
+# When the script is run from a subdirectory (e.g. python scripts/this_file.py),
+# Python adds the script's directory to sys.path rather than cwd, so relative
+# imports like 'helper_functions' would fail.  This block walks up until it
+# finds the directory that contains 'helper_functions' and inserts it.
+_script_dir = Path(__file__).resolve().parent
+_project_root = next(
+    (p for p in [_script_dir, _script_dir.parent, _script_dir.parent.parent]
+     if (p / "helper_functions").is_dir()),
+    _script_dir,
+)
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
+# ─────────────────────────────────────────────────────────────────────────────
 
 import numpy as np
 from sklearn.cluster import SpectralClustering
@@ -55,12 +72,11 @@ from model.initialization import init_spectral_with_z
 # ─────────────────────────────────────────────────────────────────────────────
 # OAT design constants  (same grid as _timmm_oat_study.py, but 10 data seeds)
 # ─────────────────────────────────────────────────────────────────────────────
-
-SEEDS     = (42, 123, 999)   # 3 data seeds — restarts carry the variance for consensus
+SEEDS     = (42, 123, 999, 7, 31, 17)   # was (42, 123, 999)  # 3 data seeds — restarts carry the variance for consensus
 C_VALUES  = (2, 5, 10, 15, 20)   # C=1 excluded — consensus clustering is trivial/degenerate for a single cluster
-N_VALUES  = (20, 50, 100, 200, 500, 1000)
+N_VALUES  = (20, 50, 100, 200, 500)      # was (..., 1000)
 N_ITEMS   = (5, 10, 20, 50, 100)
-BD_VALUES = (0.0, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0)
+BD_VALUES = (0.0, 0.1, 0.2, 0.4, 1.0)   # was (..., 0.6, 0.8, ...)
 TH_VALUES = (0.01, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0)
 
 C_DEF, N_DEF, NI_DEF, BD_DEF, TH_DEF = 5, 200, 20, 0.4, 1.0
@@ -650,6 +666,15 @@ def main() -> None:
         "--resume-dir", type=str, default=None,
         help="Resume an interrupted run from this directory.",
     )
+    parser.add_argument(
+        "--output-dir", type=str, default=None,
+        help=(
+            "Root directory in which to create the timestamped run folder. "
+            "Defaults to 'simulation_recovery_runs/' relative to the working "
+            "directory.  On a remote server, set this to an absolute path "
+            "(e.g. /data/runs).  Ignored when --resume-dir is set."
+        ),
+    )
     args = parser.parse_args()
 
     scenarios = oat_scenarios()
@@ -673,8 +698,16 @@ def main() -> None:
         print(f"Resuming: {out_dir}")
         print(f"  Already done: {len(completed)},  remaining: {len(scenarios)}")
     else:
-        timestamp  = time.strftime("%Y%m%d_%H%M%S")
-        out_dir    = Path("simulation_recovery_runs") / f"recovery_timmm_consensus_{timestamp}"
+        timestamp   = time.strftime("%Y%m%d_%H%M%S")
+        run_tag     = (
+            f"recovery_timmm_consensus"
+            f"_S{len(SEEDS)}"
+            f"_R{args.n_restarts}"
+            f"_iter{args.n_iter}"
+            f"_{timestamp}"
+        )
+        root_dir    = Path(args.output_dir) if args.output_dir else Path("simulation_recovery_consensus_runs")
+        out_dir     = root_dir / run_tag
         out_dir.mkdir(parents=True, exist_ok=True)
         completed  = []
         metadata   = {

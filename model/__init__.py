@@ -11,6 +11,7 @@ from .TiedMallowsModel import (
     summarize_theta,
     init_spectral_with_z,
     init_clusters_default,
+    init_blocks_spectral,
     fast_gibbs_reassign_one_item,
     icm_sweep_cluster,
     logsumexp,
@@ -25,6 +26,22 @@ from .TiedMallowsModel import (
     print_acceptance_summary,
 )
 from .augmentation import detect_missing, PartialRankingInfo
+from .identifiability import (
+    compute_dmin_plugin,
+    compute_dmin_posterior_averaged,
+    log_one_over_beta_pair,
+)
+from .summaries import (
+    greedy_consensus_recovery,
+    consensus_from_samples,
+    medoid_from_samples,
+    build_posterior_pairwise_matrix,
+    merge_threshold,
+)
+from .theta_conditional_map import (
+    theta_conditional_map_for_cluster,
+    solve_theta_conditional_map,
+)
 
 __all__ = [
     "MixtureRankingModel",
@@ -36,6 +53,7 @@ __all__ = [
     "summarize_theta",
     "init_spectral_with_z",
     "init_clusters_default",
+    "init_blocks_spectral",
     "fast_gibbs_reassign_one_item",
     "icm_sweep_cluster",
     "logsumexp",
@@ -50,4 +68,11 @@ __all__ = [
     "print_acceptance_summary",
     "detect_missing",
     "PartialRankingInfo",
+    "greedy_consensus_recovery",
+    "consensus_from_samples",
+    "medoid_from_samples",
+    "build_posterior_pairwise_matrix",
+    "merge_threshold",
+    "theta_conditional_map_for_cluster",
+    "solve_theta_conditional_map",
 ]
